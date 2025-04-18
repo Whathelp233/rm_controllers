@@ -46,7 +46,7 @@ bool SentryController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
 {
   ChassisBase::init(robot_hw, root_nh, controller_nh);
   ros::NodeHandle nh_wheel = ros::NodeHandle(controller_nh, "wheel");
-  ros::NodeHandle nh_brake = ros::NodeHandle(controller_nh, "catapult");
+  ros::NodeHandle nh_brake = ros::NodeHandle(controller_nh, "catapult");//弹射器？
   if (!nh_brake.getParam("catapult_angle", catapult_angle_) || !nh_brake.getParam("velocity_coefficient", vel_coff_) ||
       !nh_brake.getParam("lock_duration", lock_duratoin_))
   {
