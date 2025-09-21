@@ -35,11 +35,12 @@
 // Created by qiayuan on 1/16/21.
 //
 #include "rm_gimbal_controllers/gimbal_base.h"
-
 #include <string>
 #include <angles/angles.h>
 #include <rm_common/ros_utilities.h>
 #include <rm_common/ori_tool.h>
+#include <rm_common/lqr.h>
+#include <Eigen/Dense>
 #include <pluginlib/class_list_macros.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf/transform_datatypes.h>
@@ -50,7 +51,6 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
 {
   XmlRpc::XmlRpcValue xml_rpc_value;
   bool enable_feedforward;
-  
   enable_feedforward = controller_nh.getParam("feedforward", xml_rpc_value);
   if (enable_feedforward)
   {
@@ -67,11 +67,12 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   chassis_vel_ = std::make_shared<ChassisVel>(chassis_vel_nh);
   ros::NodeHandle nh_bullet_solver = ros::NodeHandle(controller_nh, "bullet_solver");
   bullet_solver_ = std::make_shared<BulletSolver>(nh_bullet_solver);
-
   ros::NodeHandle nh_yaw = ros::NodeHandle(controller_nh, "yaw");
   ros::NodeHandle nh_pitch = ros::NodeHandle(controller_nh, "pitch");
-  ros::NodeHandle nh_pid_yaw_pos = ros::NodeHandle(controller_nh, "yaw/pid_pos");
+  //ros::NodeHandle nh_pid_yaw_pos = ros::NodeHandle(controller_nh, "yaw/pid_pos");
   ros::NodeHandle nh_pid_pitch_pos = ros::NodeHandle(controller_nh, "pitch/pid_pos");
+  ros::NodeHandle nh_base_yaw = ros::NodeHandle(controller_nh, "base_yaw");
+
 
   config_ = { .yaw_k_v_ = getParam(nh_yaw, "k_v", 0.),
               .pitch_k_v_ = getParam(nh_pitch, "k_v", 0.),
@@ -86,10 +87,10 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
 
   hardware_interface::EffortJointInterface* effort_joint_interface =
       robot_hw->get<hardware_interface::EffortJointInterface>();
-  if (!ctrl_yaw_.init(effort_joint_interface, nh_yaw) || !ctrl_pitch_.init(effort_joint_interface, nh_pitch) ||
-      !pid_yaw_pos_.init(nh_pid_yaw_pos) || !pid_pitch_pos_.init(nh_pid_pitch_pos))
+  if (!ctrl_base_yaw_.init(effort_joint_interface,nh_base_yaw)||!ctrl_yaw_.init(effort_joint_interface,nh_yaw)||!ctrl_pitch_.init(effort_joint_interface, nh_pitch) ||
+     !pid_pitch_pos_.init(nh_pid_pitch_pos))
     return false;
-
+  ROS_WARN("init_clear");
   robot_state_handle_ = robot_hw->get<rm_control::RobotStateInterface>()->getHandle("robot_state");
   if (!controller_nh.hasParam("imu_name"))
     has_imu_ = false;
@@ -114,6 +115,7 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   }
   pitch_joint_urdf_ = urdf.getJoint(ctrl_pitch_.getJointName());
   yaw_joint_urdf_ = urdf.getJoint(ctrl_yaw_.getJointName());
+  base_yaw_joint_urdf_ = urdf.getJoint(ctrl_base_yaw_.getJointName());
   if (!pitch_joint_urdf_)
   {
     ROS_ERROR("Could not find joint pitch in urdf");
@@ -122,6 +124,11 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   if (!yaw_joint_urdf_)
   {
     ROS_ERROR("Could not find joint yaw in urdf");
+    return false;
+  }
+  if (!base_yaw_joint_urdf_)
+  {
+    ROS_ERROR("Could not find joint base_yaw in urdf");
     return false;
   }
 
@@ -135,57 +142,80 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   odom2base_.header.frame_id = "odom";
   odom2base_.child_frame_id = yaw_joint_urdf_->parent_link_name;
   odom2base_.transform.rotation.w = 1.;
+  odom2base_yaw_.header.frame_id = "odom";
+  odom2base_yaw_.child_frame_id = base_yaw_joint_urdf_->child_link_name;
+  odom2base_yaw_.transform.rotation.w = 1.;
+  // ROS_INFO("1");
 
   cmd_gimbal_sub_ = controller_nh.subscribe<rm_msgs::GimbalCmd>("command", 1, &Controller::commandCB, this);
   data_track_sub_ = controller_nh.subscribe<rm_msgs::TrackData>("/track", 1, &Controller::trackCB, this);
   publish_rate_ = getParam(controller_nh, "publish_rate", 100.);
   error_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalDesError>(controller_nh, "error", 100));
   yaw_pos_state_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalPosState>(nh_yaw, "pos_state", 1));
+
   pitch_pos_state_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalPosState>(nh_pitch, "pos_state", 1));
 
   ramp_rate_pitch_ = new RampFilter<double>(0, 0.001);
   ramp_rate_yaw_ = new RampFilter<double>(0, 0.001);
 
-
-
+    //lqr compute
+  // double a_1 = getParam(controller_nh, "b1", 0.1);  // 阻尼系数1，默认0.0
+  // double a_2 = getParam(controller_nh, "b2", 0.1);  // 阻尼系数2，默认0.0
+  // double j_1 = getParam(controller_nh, "j1", 1.0);  // 惯性1，默认1.0
+  // double j_2 = getParam(controller_nh, "j2", 1.0);  // 惯性2，默认1.0
+  // double d_c = getParam(controller_nh, "d_c", 0.0);  // 惯性耦合，默认0.0
+  // double q1 = getParam(controller_nh, "q1", 100.0);  // 状态权重1，默认100.0
+  // double q2 = getParam(controller_nh, "q2", 10.0);   // 状态权重2，默认10.0
+  // double q3 = getParam(controller_nh, "q3", 100.0);  // 状态权重3，默认100.0
+  // double q4 = getParam(controller_nh, "q4", 10.0);   // 状态权重4，默认10.0
+  // double r1 = getParam(controller_nh, "r1", 1.0);    // 输入权重1，默认1.0
+  // double r2 = getParam(controller_nh, "r2", 1.0);    // 输入权重2，默认1.0
+  kf_yaw_ = KalmanFilter(0.01, 0.1, 0.0, 1.0);
+  kf_base_yaw_ = KalmanFilter(0.01, 0.1, 0.0, 1.0);
+  
+  config_.a1_ = getParam(controller_nh, "a1", 0.1);  // 阻尼系数1
+  config_.a2_ = getParam(controller_nh, "a2", 0.1);  // 阻尼系数2
+  config_.j1_ = getParam(controller_nh, "j1", 1.0);  // 惯性1
+  config_.j2_ = getParam(controller_nh, "j2", 1.0);  // 惯性2
+  config_.dc_ = getParam(controller_nh, "dc", 0.0);  // 惯性耦合
+  config_.q1_ = getParam(controller_nh, "q1", 100.0);  // 状态权重1
+  config_.q2_ = getParam(controller_nh, "q2", 10.0);   // 状态权重2
+  config_.q3_ = getParam(controller_nh, "q3", 100.0);  // 状态权重3
+  config_.q4_ = getParam(controller_nh, "q4", 10.0);   // 状态权重4
+  config_.r1_ = getParam(controller_nh, "r1", 1.0);    // 输入权重1 
+  config_.r2_ = getParam(controller_nh, "r2", 1.0);    // 输入权重2
 try {
 
-    //lqr compute
-  double b1 = getParam(controller_nh, "b1", 0.0);  // 阻尼系数1，默认0.0
-  double b2 = getParam(controller_nh, "b2", 0.0);  // 阻尼系数2，默认0.0
-  double j1 = getParam(controller_nh, "j1", 1.0);  // 惯性1，默认1.0
-  double j2 = getParam(controller_nh, "j2", 1.0);  // 惯性2，默认1.0
-  double q1 = getParam(controller_nh, "q1", 100.0);  // 状态权重1，默认100.0
-  double q2 = getParam(controller_nh, "q2", 10.0);   // 状态权重2，默认10.0
-  double q3 = getParam(controller_nh, "q3", 100.0);  // 状态权重3，默认100.0
-  double q4 = getParam(controller_nh, "q4", 10.0);   // 状态权重4，默认10.0
-  double r1 = getParam(controller_nh, "r1", 1.0);    // 输入权重1，默认1.0
-  double r2 = getParam(controller_nh, "r2", 1.0);    // 输入权重2，默认1.0
+
+
   Eigen::MatrixXd A(4,4),B(4,2),Q(4,4),R(2,2);
-  A<<0.,1.,0.,0.,
-     0.,-b1/j1,0.,0.,
-     0.,0.,0.,1.,
-     0.,b1/j1-b2/j2,0.,-b2/j2;
+A << 0., 1., 0., 0.,
+     0., -config_.a1_/config_.j1_, 0., config_.dc_/config_.j1_,
+     0., 0., 0., 1.,
+     0., config_.dc_/config_.j2_, 0., -config_.a2_/config_.j2_;
 
-  B<<0.,0.,
-  1.0/j1,-1.0/j1,
-  0.,0.,
-  -1.0/j1,1.0/j1+1.0/j2;
+B << 0., 0.,
+     1./config_.j1_, 0.,
+     0., 0.,
+     0., 1./config_.j2_;
 
-  Q<<q1,0.,0.,0.,
-  0.,q2,0.,0.,
-  0.,0.,q3,0.,
-  0.,0.,0.,q4;
+  Q << config_.q1_,0.,0.,0.,
+  0.,config_.q2_,0.,0.,
+  0.,0.,config_.q3_,0.,
+  0.,0.,0.,config_.q4_;
 
-  R<<r1,0.,
-     0.,r2;
+  R << config_.r1_,0.,
+       0.,config_.r2_;
 //  ROS_INFO("b1: %f, j1: %f", b1, j1);
 //  ROS_INFO("A matrix:\n%s", A.toString().c_str());  // 如果 Eigen 支持
   state_yaw_.resize(4);
-  state_pitch_.resize(4);  
-  //Lqr<double> lqr(A,B,Q,R);
-  //K_yaw_ = lqr.computeK()?lqr.getK():Eigen::MatrixXd::Zero(2,4);
-  K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
+  state_pitch_.resize(4);
+  Lqr<double> lqr(A,B,Q,R,K_yaw_); 
+      if (!lqr.computeK(A, B, Q, R, K_yaw_)) {
+        K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
+        ROS_WARN("Using default K matrix");
+      }
+ // K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
   ROS_INFO("Initializing gimbal controller...");
 } catch (const std::exception& e) {
   ROS_ERROR("Exception in init: %s", e.what());
@@ -193,7 +223,30 @@ try {
 }   
   return true;
 }
+// bool Controller::computeLQR(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, Eigen::MatrixXd& K) {
+//   try {
+//     // 检查矩阵有效性
+//     if (!A.allFinite() || !B.allFinite() || !Q.allFinite() || !R.allFinite()) {
+//       ROS_ERROR("LQR matrices contain NaN or Inf");
+//       return false;
+//     }
 
+//     // 计算 P
+//     Eigen::MatrixXd P = solveRiccatiIterative(A, B, Q, R);
+//     if (P.rows() == 0 || P.cols() == 0) {
+//       ROS_ERROR("Riccati computation failed");
+//       return false;
+//     }
+
+//     // 正确的 LQR 增益公式：K = R^{-1} B^T P
+//     K = R.inverse() * B.transpose() * P;
+//     ROS_INFO("LQR K matrix computed successfully: %ldx%ld", K.rows(), K.cols());
+//     return true;
+//   } catch (const std::exception& e) {
+//     ROS_ERROR("Exception in computeLQR: %s", e.what());
+//     return false;
+//   }
+// }
 void Controller::starting(const ros::Time& /*unused*/)
 {
   state_ = RATE;
@@ -210,6 +263,9 @@ void Controller::update(const ros::Time& time, const ros::Duration& period)
   ramp_rate_yaw_->setAcc(config_.accel_yaw_);
   ramp_rate_pitch_->input(cmd_gimbal_.rate_pitch);
   ramp_rate_yaw_->input(cmd_gimbal_.rate_yaw);
+  //test
+  //ROS_INFO("Gimbal yaw: %lf", cmd_gimbal_.rate_yaw);
+  //ROS_INFO("Gimbal ptich: %lf", cmd_gimbal_.rate_pitch);
   cmd_gimbal_.rate_pitch = ramp_rate_pitch_->output();
   cmd_gimbal_.rate_yaw = ramp_rate_yaw_->output();
   try
@@ -373,7 +429,7 @@ void Controller::track(const ros::Time& time)
       error_pub_->msg_.stamp = time;
       error_pub_->msg_.error = solve_success ? error : 1.0;
       error_pub_->unlockAndPublish();
-    }
+    } 
     bullet_solver_->bulletModelPub(odom2pitch_, time);
     last_publish_time_ = time;
   }
@@ -441,7 +497,8 @@ bool Controller::setDesIntoLimit(double& real_des, double current_des, double ba
 
 void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
 {
-  geometry_msgs::Vector3 gyro, angular_vel_pitch, angular_vel_yaw;
+  geometry_msgs::Vector3 gyro, angular_vel_pitch, angular_vel_yaw,angular_vel_base_yaw;
+  //test
   if (has_imu_)
   {
     gyro.x = imu_sensor_handle_.getAngularVelocity()[0];
@@ -455,6 +512,9 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
       tf2::doTransform(gyro, angular_vel_yaw,
                        robot_state_handle_.lookupTransform(yaw_joint_urdf_->child_link_name,
                                                            imu_sensor_handle_.getFrameId(), time));
+      tf2::doTransform(gyro, angular_vel_base_yaw,
+                       robot_state_handle_.lookupTransform(base_yaw_joint_urdf_->child_link_name,
+                                                           imu_sensor_handle_.getFrameId(), time));                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
     }
     catch (tf2::TransformException& ex)
     {
@@ -466,24 +526,32 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   {
     angular_vel_yaw.z = ctrl_yaw_.joint_.getVelocity();
     angular_vel_pitch.y = ctrl_pitch_.joint_.getVelocity();
+    angular_vel_base_yaw.z = ctrl_base_yaw_.joint_.getVelocity();
   }
-  double roll_real, pitch_real, yaw_real, roll_des, pitch_des, yaw_des;
+  double roll_real, pitch_real, yaw_real, roll_des, pitch_des, yaw_des,base_yaw_real, base_yaw_des;
   quatToRPY(odom2gimbal_des_.transform.rotation, roll_des, pitch_des, yaw_des);
   quatToRPY(odom2pitch_.transform.rotation, roll_real, pitch_real, yaw_real);
-  double yaw_angle_error = angles::shortest_angular_distance(yaw_real, yaw_des);
+  quatToRPY(odom2base_yaw_.transform.rotation, roll_real, pitch_real, base_yaw_real);
+  //double yaw_angle_error = angles::shortest_angular_distance(yaw_real, yaw_des);
+
   double pitch_angle_error = angles::shortest_angular_distance(pitch_real, pitch_des);
   pid_pitch_pos_.computeCommand(pitch_angle_error, period);
-  pid_yaw_pos_.computeCommand(yaw_angle_error, period);
+  
   // LQR control
-      state_yaw_ << yaw_real, angular_vel_yaw.z, pitch_real, angular_vel_pitch.y;
+      yaw_real = angles::normalize_angle_positive(yaw_real);
+      yaw_des = angles::normalize_angle_positive(yaw_des);
+      state_yaw_ << yaw_real, angular_vel_yaw.z, base_yaw_real, angular_vel_base_yaw.z;
       Eigen::VectorXd u = -K_yaw_ * state_yaw_;
+      //ROS_INFO("State: [%.2f, %.2f, %.2f, %.2f], Command: [%.2f, %.2f]", state_yaw_(0), state_yaw_(1), state_yaw_(2), state_yaw_(3), u(0), u(1));
       double u_yaw = u(0);
-      // double u_pitch = u(1);
-
-  double yaw_vel_des = 0., pitch_vel_des = 0.;
+     
+      //double u_pitch = u(1);
+  // pid_yaw_pos_.computeCommand(yaw_angle_error, period);
+  double yaw_vel_des = 0., pitch_vel_des = 0.,base_yaw_vel_des=0.;
   if (state_ == RATE)
   {
     yaw_vel_des = cmd_gimbal_.rate_yaw;
+    base_yaw_vel_des = cmd_gimbal_.rate_yaw;
     pitch_vel_des = cmd_gimbal_.rate_pitch;
   }
   else if (state_ == TRACK)
@@ -517,14 +585,26 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
       ROS_WARN("%s", ex.what());
     }
   }
-  if (!pitch_des_in_limit_)
-    pitch_vel_des = 0.;
-  if (!yaw_des_in_limit_)
-    yaw_vel_des = 0.;
+ // if (!pitch_des_in_limit_)
+ //   pitch_vel_des = 0.;
+ // if (!yaw_des_in_limit_)
+ //   yaw_vel_des = 0.;
 
-  pid_pitch_pos_.computeCommand(pitch_angle_error, period);
-  pid_yaw_pos_.computeCommand(yaw_angle_error, period);
+  // pid_pitch_pos_.computeCommand(pitch_angle_error, period);
+  
   // publish state
+  //test
+  Eigen::Vector4d x_ref;
+  x_ref << yaw_des, yaw_vel_des, base_yaw_des, base_yaw_vel_des;
+  //ROS_INFO("yaw_vel_des: %lf, pitch_vel_des: %lf", yaw_vel_des, pitch_vel_des);
+  Eigen::Vector4d x_err = state_yaw_ - x_ref;
+  // x_err(0) = yaw_angle_error;
+  u = -K_yaw_ * x_err;
+  u_yaw = u(0);
+  ROS_WARN("K matrix:\n%lf",u(1));
+  ROS_WARN("K2 matrix:\n%lf",u(0));
+  // pid_yaw_pos_.computeCommand(u_yaw, period);
+  //test
   if (loop_count_ % 10 == 0)
   {
     if (yaw_pos_state_pub_ && yaw_pos_state_pub_->trylock())
@@ -533,10 +613,11 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
       yaw_pos_state_pub_->msg_.set_point = yaw_des;
       yaw_pos_state_pub_->msg_.set_point_dot = yaw_vel_des;
       yaw_pos_state_pub_->msg_.process_value = yaw_real;
-      yaw_pos_state_pub_->msg_.error = angles::shortest_angular_distance(yaw_real, yaw_des);
+      yaw_pos_state_pub_->msg_.error = x_err(0);
       // yaw_pos_state_pub_->msg_.command = pid_yaw_pos_.getCurrentCmd();
 
       yaw_pos_state_pub_->msg_.command = u_yaw;
+
       yaw_pos_state_pub_->unlockAndPublish();
     }
     if (pitch_pos_state_pub_ && pitch_pos_state_pub_->trylock())
@@ -551,13 +632,19 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
     }
   }
   loop_count_++;
-
-  ctrl_yaw_.setCommand(u_yaw - config_.k_chassis_vel_ * chassis_vel_->angular_->z() +
-                       config_.yaw_k_v_ * yaw_vel_des + ctrl_yaw_.joint_.getVelocity() - angular_vel_yaw.z);
+  u_yaw = kf_yaw_.update(u(1));  // 对 yaw 输出滤波
+double u_base_yaw = kf_base_yaw_.update(u(0)); 
+  //ROS_INFO("Yaw command: %lf, Pitch command: %lf", u_yaw + 1, pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des + ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
+  //u_yaw = std::clamp(u_yaw, -10.0, 10.0);
+  ctrl_yaw_.setCommand(u_yaw+ config_.yaw_k_v_ * yaw_vel_des +
+                         ctrl_yaw_.joint_.getVelocity() - angular_vel_yaw.y);
+  ctrl_base_yaw_.setCommand(u_base_yaw*0.01+ config_.yaw_k_v_ * base_yaw_vel_des +
+                         ctrl_base_yaw_.joint_.getVelocity() - angular_vel_base_yaw.y);
   ctrl_pitch_.setCommand(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
                          ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
 
   ctrl_yaw_.update(time, period);
+  ctrl_base_yaw_.update(time, period);
   ctrl_pitch_.update(time, period);
   ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + feedForward(time));
 }
@@ -603,6 +690,7 @@ void Controller::updateChassisVel()
 void Controller::commandCB(const rm_msgs::GimbalCmdConstPtr& msg)
 {
   cmd_rt_buffer_.writeFromNonRT(*msg);
+  //ROS_INFO("[Gimbal] Get new command");
 }
 
 void Controller::trackCB(const rm_msgs::TrackDataConstPtr& msg)
@@ -624,13 +712,37 @@ void Controller::reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uin
     config.accel_pitch_ = init_config.accel_pitch_;
     config.accel_yaw_ = init_config.accel_yaw_;
     dynamic_reconfig_initialized_ = true;
+      config_.q1_ = config.q1;
+      config_.q2_ = config.q2;
+      config_.q3_ = config.q3;
+      config_.q4_ = config.q4;
+      config_.r1_ = config.r1;
+      config_.r2_ = config.r2;
+      config_.a1_ = config.a1;
+      config_.a2_ = config.a2;
+      config_.j1_ = config.j1;
+      config_.j2_ = config.j2;
+      config_.dc_ = config.dc_;
+
+    // ... 更新其他参数
+
+    // 重新构建矩阵并计算 K
+  Eigen::Matrix4d A, B, Q, R;
+  // ... 相同构建代码
+  Lqr<double> lqr(A, B, Q, R, K_yaw_);
+  lqr.computeK(A, B, Q, R, K_yaw_);
+
+  config_rt_buffer_.writeFromNonRT(config_);
   }
   GimbalConfig config_non_rt{ .yaw_k_v_ = config.yaw_k_v_,
                               .pitch_k_v_ = config.pitch_k_v_,
                               .k_chassis_vel_ = config.k_chassis_vel_,
                               .accel_pitch_ = config.accel_pitch_,
-                              .accel_yaw_ = config.accel_yaw_ };
+                              .accel_yaw_ = config.accel_yaw_ 
+                              };
+  
   config_rt_buffer_.writeFromNonRT(config_non_rt);
+  
 }
 
 }  // namespace rm_gimbal_controllers

@@ -34,10 +34,10 @@
 //
 // Created by qiayuan on 1/16/21.
 //
-
-#pragma once
+        
 
 #include <effort_controllers/joint_velocity_controller.h>
+#include <effort_controllers/joint_effort_controller.h>
 #include <controller_interface/multi_interface_controller.h>
 #include <hardware_interface/joint_command_interface.h>
 #include <hardware_interface/imu_sensor_interface.h>
@@ -63,8 +63,30 @@ struct GimbalConfig
 {
   double yaw_k_v_, pitch_k_v_, k_chassis_vel_;
   double accel_pitch_{}, accel_yaw_{};
+  double q1_, q2_, q3_, q4_, r1_, r2_, a1_, a2_, j1_, j2_, dc_;
 };
+class KalmanFilter {
+public:
+  KalmanFilter() : x_(0.0), P_(1.0), Q_(0.01), R_(0.1) {}  // 默认构造函数
+  KalmanFilter(double process_noise, double measurement_noise, double initial_estimate, double initial_error)
+    : x_(initial_estimate), P_(initial_error), Q_(process_noise), R_(measurement_noise) {}  // 带参数构造函数
 
+  double update(double measurement) {
+    // 预测步骤
+    double x_pred = x_;
+    double P_pred = P_ + Q_;
+
+    // 更新步骤
+    double K = P_pred / (P_pred + R_);  // 卡尔曼增益
+    x_ = x_pred + K * (measurement - x_pred);
+    P_ = (1 - K) * P_pred;
+
+    return x_;
+  }
+
+private:
+  double x_, P_, Q_, R_;
+};
 class ChassisVel
 {
 public:
@@ -139,6 +161,14 @@ public:
   void update(const ros::Time& time, const ros::Duration& period) override;
   void setDes(const ros::Time& time, double yaw_des, double pitch_des);
 
+
+    //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
+  Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
+  Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
+
+  KalmanFilter kf_yaw_;
+  KalmanFilter kf_base_yaw_;
+
 private:
   void rate(const ros::Time& time, const ros::Duration& period);
   void track(const ros::Time& time);
@@ -152,11 +182,37 @@ private:
   void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
   void trackCB(const rm_msgs::TrackDataConstPtr& msg);
   void reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t);
+  
+  //lqr_test
+  // Eigen::MatrixXd solveRiccatiIterative(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, int max_iter = 100, double tol = 1e-6) {
+  //   Eigen::MatrixXd P = Q;  // 初始 P = Q
+  //   Eigen::MatrixXd P_prev;
+
+  //   for (int iter = 0; iter < max_iter; ++iter) {
+  //     P_prev = P;
+  //     Eigen::MatrixXd BRB = B.transpose() * P * B + R;
+  //     Eigen::MatrixXd BRB_inv = BRB.inverse();
+  //     P = A.transpose() * P * A - A.transpose() * P * B * BRB_inv * B.transpose() * P * A + Q;
+
+  //     // 检查收敛
+  //     if ((P - P_prev).norm() < tol) {
+  //       ROS_INFO("Riccati converged in %d iterations", iter + 1);
+  //       break;
+  //     }
+  //   }
+  //   return P;
+  // }
+
+  //bool computeLQR(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, Eigen::MatrixXd& K);
 
   rm_control::RobotStateHandle robot_state_handle_;
   hardware_interface::ImuSensorHandle imu_sensor_handle_;
   bool has_imu_ = true;
-  effort_controllers::JointVelocityController ctrl_yaw_, ctrl_pitch_;
+  effort_controllers::JointVelocityController ctrl_pitch_;
+  effort_controllers::JointVelocityController  ctrl_yaw_;
+  effort_controllers::JointVelocityController  ctrl_base_yaw_;
+  // hardware_interface::JointHandle ctrl_yaw_;
+
   control_toolbox::Pid pid_yaw_pos_, pid_pitch_pos_;
 
   std::shared_ptr<BulletSolver> bullet_solver_;
@@ -169,7 +225,7 @@ private:
   ros::Subscriber data_track_sub_;
   realtime_tools::RealtimeBuffer<rm_msgs::GimbalCmd> cmd_rt_buffer_;
   realtime_tools::RealtimeBuffer<rm_msgs::TrackData> track_rt_buffer_;
-  urdf::JointConstSharedPtr pitch_joint_urdf_, yaw_joint_urdf_;
+  urdf::JointConstSharedPtr pitch_joint_urdf_, yaw_joint_urdf_,base_yaw_joint_urdf_;
   
   rm_msgs::GimbalCmd cmd_gimbal_;
   rm_msgs::TrackData data_track_;
@@ -179,13 +235,11 @@ private:
   bool pitch_des_in_limit_{}, yaw_des_in_limit_{};
   int loop_count_{};
 
-  //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
-  Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
-  Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
+
 
 
   // Transform
-  geometry_msgs::TransformStamped odom2gimbal_des_, odom2pitch_, odom2base_, last_odom2base_;
+  geometry_msgs::TransformStamped odom2gimbal_des_, odom2pitch_, odom2base_, last_odom2base_,odom2base_yaw_;
 
   // Gravity Compensation
   geometry_msgs::Vector3 mass_origin_;
