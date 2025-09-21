@@ -117,7 +117,7 @@ double BulletSolver::getResistanceCoefficient(double bullet_speed) const
 }
 
 bool BulletSolver::solve(geometry_msgs::Point pos, geometry_msgs::Vector3 vel, double bullet_speed, double yaw,
-                         double v_yaw, double r1, double r2, double dz, int armors_num, double chassis_angular_vel_z)
+             double v_yaw, double r1, double r2, double dz, int armors_num, double chassis_angular_vel_z)
 {
   config_ = *config_rt_buffer_.readFromRT();
   bullet_speed_ = bullet_speed;

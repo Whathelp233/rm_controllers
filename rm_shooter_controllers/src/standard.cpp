@@ -347,7 +347,7 @@ void Controller::judgeBulletShoot(const ros::Time& time, const ros::Duration& pe
     {
       local_heat_state_pub_->msg_.stamp = time;
       local_heat_state_pub_->msg_.has_shoot = has_shoot_;
-      local_heat_state_pub_->msg_.friction_change_vel = friction_change_vel;
+      local_heat_state_pub_->msg_.friction_change_speed = friction_change_vel;
       local_heat_state_pub_->unlockAndPublish();
     }
     has_shoot_last_ = false;

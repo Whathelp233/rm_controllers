@@ -43,6 +43,7 @@
 #include <hardware_interface/imu_sensor_interface.h>
 #include <rm_common/hardware_interface/robot_state_interface.h>
 #include <rm_common/filters/filters.h>
+#include <rm_common/lqr.h>
 #include <rm_msgs/GimbalCmd.h>
 #include <rm_msgs/TrackData.h>
 #include <rm_msgs/GimbalDesError.h>
@@ -169,7 +170,7 @@ private:
   realtime_tools::RealtimeBuffer<rm_msgs::GimbalCmd> cmd_rt_buffer_;
   realtime_tools::RealtimeBuffer<rm_msgs::TrackData> track_rt_buffer_;
   urdf::JointConstSharedPtr pitch_joint_urdf_, yaw_joint_urdf_;
-
+  
   rm_msgs::GimbalCmd cmd_gimbal_;
   rm_msgs::TrackData data_track_;
   std::string gimbal_des_frame_id_{}, imu_name_{};
@@ -177,6 +178,11 @@ private:
   bool state_changed_{};
   bool pitch_des_in_limit_{}, yaw_des_in_limit_{};
   int loop_count_{};
+
+  //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
+  Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
+  Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
+
 
   // Transform
   geometry_msgs::TransformStamped odom2gimbal_des_, odom2pitch_, odom2base_, last_odom2base_;

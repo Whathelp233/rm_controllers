@@ -50,6 +50,7 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
 {
   XmlRpc::XmlRpcValue xml_rpc_value;
   bool enable_feedforward;
+  
   enable_feedforward = controller_nh.getParam("feedforward", xml_rpc_value);
   if (enable_feedforward)
   {
@@ -145,6 +146,51 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   ramp_rate_pitch_ = new RampFilter<double>(0, 0.001);
   ramp_rate_yaw_ = new RampFilter<double>(0, 0.001);
 
+
+
+try {
+
+    //lqr compute
+  double b1 = getParam(controller_nh, "b1", 0.0);  // 阻尼系数1，默认0.0
+  double b2 = getParam(controller_nh, "b2", 0.0);  // 阻尼系数2，默认0.0
+  double j1 = getParam(controller_nh, "j1", 1.0);  // 惯性1，默认1.0
+  double j2 = getParam(controller_nh, "j2", 1.0);  // 惯性2，默认1.0
+  double q1 = getParam(controller_nh, "q1", 100.0);  // 状态权重1，默认100.0
+  double q2 = getParam(controller_nh, "q2", 10.0);   // 状态权重2，默认10.0
+  double q3 = getParam(controller_nh, "q3", 100.0);  // 状态权重3，默认100.0
+  double q4 = getParam(controller_nh, "q4", 10.0);   // 状态权重4，默认10.0
+  double r1 = getParam(controller_nh, "r1", 1.0);    // 输入权重1，默认1.0
+  double r2 = getParam(controller_nh, "r2", 1.0);    // 输入权重2，默认1.0
+  Eigen::MatrixXd A(4,4),B(4,2),Q(4,4),R(2,2);
+  A<<0.,1.,0.,0.,
+     0.,-b1/j1,0.,0.,
+     0.,0.,0.,1.,
+     0.,b1/j1-b2/j2,0.,-b2/j2;
+
+  B<<0.,0.,
+  1.0/j1,-1.0/j1,
+  0.,0.,
+  -1.0/j1,1.0/j1+1.0/j2;
+
+  Q<<q1,0.,0.,0.,
+  0.,q2,0.,0.,
+  0.,0.,q3,0.,
+  0.,0.,0.,q4;
+
+  R<<r1,0.,
+     0.,r2;
+//  ROS_INFO("b1: %f, j1: %f", b1, j1);
+//  ROS_INFO("A matrix:\n%s", A.toString().c_str());  // 如果 Eigen 支持
+  state_yaw_.resize(4);
+  state_pitch_.resize(4);  
+  //Lqr<double> lqr(A,B,Q,R);
+  //K_yaw_ = lqr.computeK()?lqr.getK():Eigen::MatrixXd::Zero(2,4);
+  K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
+  ROS_INFO("Initializing gimbal controller...");
+} catch (const std::exception& e) {
+  ROS_ERROR("Exception in init: %s", e.what());
+  return false;
+}   
   return true;
 }
 
@@ -428,6 +474,11 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   double pitch_angle_error = angles::shortest_angular_distance(pitch_real, pitch_des);
   pid_pitch_pos_.computeCommand(pitch_angle_error, period);
   pid_yaw_pos_.computeCommand(yaw_angle_error, period);
+  // LQR control
+      state_yaw_ << yaw_real, angular_vel_yaw.z, pitch_real, angular_vel_pitch.y;
+      Eigen::VectorXd u = -K_yaw_ * state_yaw_;
+      double u_yaw = u(0);
+      // double u_pitch = u(1);
 
   double yaw_vel_des = 0., pitch_vel_des = 0.;
   if (state_ == RATE)
@@ -473,7 +524,6 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
 
   pid_pitch_pos_.computeCommand(pitch_angle_error, period);
   pid_yaw_pos_.computeCommand(yaw_angle_error, period);
-
   // publish state
   if (loop_count_ % 10 == 0)
   {
@@ -484,7 +534,9 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
       yaw_pos_state_pub_->msg_.set_point_dot = yaw_vel_des;
       yaw_pos_state_pub_->msg_.process_value = yaw_real;
       yaw_pos_state_pub_->msg_.error = angles::shortest_angular_distance(yaw_real, yaw_des);
-      yaw_pos_state_pub_->msg_.command = pid_yaw_pos_.getCurrentCmd();
+      // yaw_pos_state_pub_->msg_.command = pid_yaw_pos_.getCurrentCmd();
+
+      yaw_pos_state_pub_->msg_.command = u_yaw;
       yaw_pos_state_pub_->unlockAndPublish();
     }
     if (pitch_pos_state_pub_ && pitch_pos_state_pub_->trylock())
@@ -500,7 +552,7 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   }
   loop_count_++;
 
-  ctrl_yaw_.setCommand(pid_yaw_pos_.getCurrentCmd() - config_.k_chassis_vel_ * chassis_vel_->angular_->z() +
+  ctrl_yaw_.setCommand(u_yaw - config_.k_chassis_vel_ * chassis_vel_->angular_->z() +
                        config_.yaw_k_v_ * yaw_vel_des + ctrl_yaw_.joint_.getVelocity() - angular_vel_yaw.z);
   ctrl_pitch_.setCommand(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
                          ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
