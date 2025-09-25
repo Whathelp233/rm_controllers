@@ -44,6 +44,11 @@
 #include <pluginlib/class_list_macros.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf/transform_datatypes.h>
+#include <Eigen/Dense>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <vector>
 
 namespace rm_gimbal_controllers
 {
@@ -170,6 +175,8 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   // double q4 = getParam(controller_nh, "q4", 10.0);   // 状态权重4，默认10.0
   // double r1 = getParam(controller_nh, "r1", 1.0);    // 输入权重1，默认1.0
   // double r2 = getParam(controller_nh, "r2", 1.0);    // 输入权重2，默认1.0
+  enable_online_lqr = getParam(controller_nh, "enable_online_lqr", false);
+
   kf_yaw_ = KalmanFilter(0.01, 0.1, 0.0, 1.0);
   kf_base_yaw_ = KalmanFilter(0.01, 0.1, 0.0, 1.0);
   
@@ -268,6 +275,8 @@ void Controller::update(const ros::Time& time, const ros::Duration& period)
   //ROS_INFO("Gimbal ptich: %lf", cmd_gimbal_.rate_pitch);
   cmd_gimbal_.rate_pitch = ramp_rate_pitch_->output();
   cmd_gimbal_.rate_yaw = ramp_rate_yaw_->output();
+
+   
   try
   {
     odom2pitch_ = robot_state_handle_.lookupTransform("odom", pitch_joint_urdf_->child_link_name, time);
@@ -636,10 +645,8 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
 double u_base_yaw = kf_base_yaw_.update(u(0)); 
   //ROS_INFO("Yaw command: %lf, Pitch command: %lf", u_yaw + 1, pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des + ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
   //u_yaw = std::clamp(u_yaw, -10.0, 10.0);
-  ctrl_yaw_.setCommand(u_yaw+ config_.yaw_k_v_ * yaw_vel_des +
-                         ctrl_yaw_.joint_.getVelocity() - angular_vel_yaw.y);
-  ctrl_base_yaw_.setCommand(u_base_yaw*0.01+ config_.yaw_k_v_ * base_yaw_vel_des +
-                         ctrl_base_yaw_.joint_.getVelocity() - angular_vel_base_yaw.y);
+  ctrl_yaw_.setCommand(u_yaw);
+  ctrl_base_yaw_.setCommand(u_base_yaw);
   ctrl_pitch_.setCommand(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
                          ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
 
@@ -647,7 +654,33 @@ double u_base_yaw = kf_base_yaw_.update(u(0));
   ctrl_base_yaw_.update(time, period);
   ctrl_pitch_.update(time, period);
   ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + feedForward(time));
+
+  Eigen::VectorXd x(n_);//RLS_input
+  x(0) = ctrl_base_yaw_.joint_.getPosition();
+  x(1) = ctrl_base_yaw_.joint_.getVelocity();
+  x(2) = ctrl_yaw_.joint_.getPosition();
+  x(3) = ctrl_yaw_.joint_.getVelocity();
+//确定是否改变现在使用的K增益
+    Eigen::MatrixXd K_use(2,4);
+  std::lock_guard<std::mutex> lk(K_mutex_);
+    if (switching_) {
+      double t = (ros::Time::now() - switch_start_time_).toSec();
+      double alpha = std::min(1.0, t / switch_smooth_T_);
+      K_use = (1.0 - alpha) * K_old_ + alpha * K_target_;
+      if (alpha >= 1.0) {
+        switching_ = false;
+        K_old_ = K_target_;
+        K_current_ = K_target_;
+        u_max_ = u_max_normal_;
+      }
+    } else {
+      K_use = K_current_;
+    }
+    x_prev_ = x;
+    u_prev_sample_ = vel_ref;
+    have_prev_sample_ = true;
 }
+
 
 double Controller::feedForward(const ros::Time& time)
 {
@@ -687,7 +720,196 @@ void Controller::updateChassisVel()
   last_odom2base_ = odom2base_;
 }
 
-void Controller::commandCB(const rm_msgs::GimbalCmdConstPtr& msg)
+void Controller::updateRLS()
+{
+  // if (!enable_online_lqr_) return; // 如果禁用，直接返回
+
+  // // 在这里可以使用RLS更新A,B（此处省略，给定固定A,B即可）
+  // A_ = updateAWithRLS(...);
+  // B_ = updateBWithRLS(...);
+  std::lock_guard<std::mutex> lk(rls_mutex_);
+    if (have_prev_sample_ && !driver_saturated_) {
+      Eigen::VectorXd phi(n_ + m_);
+      phi << x_prev_, u_prev_sample_;
+
+      // RLS 增益
+      Eigen::VectorXd Pphi = Pcov_ * phi;
+      double denom = lambda_rls_ + phi.dot(Pphi);
+      if (denom < 1e-12) denom = 1e-12;
+      Eigen::VectorXd Kk = Pphi / denom; // (n+m) x 1
+
+      // 预测与误差
+      Eigen::VectorXd pred = Theta_ * phi; // n x 1
+      Eigen::VectorXd err = x - pred;
+
+      // 更新 Theta 与 Pcov
+      Theta_ += err * Kk.transpose();
+      Pcov_ = (Pcov_ - Kk * (phi.transpose() * Pcov_)) / lambda_rls_;
+      Pcov_ = 0.5 * (Pcov_ + Pcov_.transpose());
+
+      // 存入 recent buffer 用于 residual 计算
+      if ((int)recent_phi_.size() >= recent_buffer_len_) {
+        recent_phi_.erase(recent_phi_.begin());
+        recent_xnext_.erase(recent_xnext_.begin());
+      }
+      recent_phi_.push_back(phi);
+      recent_xnext_.push_back(x);
+
+      sample_count_++;
+        // 更新 prev sample: 把现在的 x 和刚下发的 vel_ref 存为下一步的 prev
+      x_prev_ = x;
+      u_prev_sample_ = vel_ref;
+      have_prev_sample_ = true;
+    }
+}
+void Controller::onlineLQRUpdate()
+{
+  if(enable_online_lqr==false)
+    return;
+  ros::Rate rate(worker_hz_);
+  while (ros::ok() && running_) {
+    Eigen::MatrixXd Theta_copy;
+    {
+      std::lock_guard<std::mutex> lk(rls_mutex_);
+      Theta_copy = Theta_;
+    }
+
+    if (sample_count_ < (size_t)N_min_samples_) { rate.sleep(); continue; }
+
+    // 计算 residual（用最近窗口）
+    double residual = computeResidual(Theta_copy);
+    if (residual > residual_threshold_) { rate.sleep(); continue; }
+
+    // 分解 Theta -> A_est (n x n), B_est (n x m)
+    Eigen::MatrixXd A_est = Theta_copy.block(0, 0, n_, n_);
+    Eigen::MatrixXd B_est = Theta_copy.block(0, n_, n_, m_);
+
+    // 计算离散 LQR
+    Eigen::MatrixXd K_new;
+    bool ok = computeDLQRdiscrete(A_est, B_est, Qd_, Rd_, K_new);
+    if (!ok) { ROS_WARN("DLQR solver failed"); rate.sleep(); continue; }
+
+    // 验证 K_new
+    if (!validateK(A_est, B_est, K_new)) { ROS_WARN("K_new validation failed"); rate.sleep(); continue; }
+
+    // 稳定性检查：需要连续 stable_needed_ 次差异小才接受
+    double diff = (K_new - last_successful_K_).norm();
+    if (last_successful_K_.size() == 0) {
+      last_successful_K_ = K_new;
+      stable_count_ = 1;
+    } else {
+      if (diff < stable_tol_) stable_count_++; else { stable_count_ = 1; last_successful_K_ = K_new; }
+    }
+
+    if (stable_count_ >= stable_needed_) {
+      // schedule smooth switch
+      {
+        std::lock_guard<std::mutex> lk(K_mutex_);
+        K_target_ = K_new;
+        switching_ = true;
+        switch_start_time_ = ros::Time::now();
+        // during switch make output conservative
+        u_max_ = 0.5 * u_max_normal_;
+      }
+      saveKToYaml(K_new, save_k_path_);
+      ROS_INFO("AdaptiveLQR: accepted K_new, scheduled switch and saved.");
+      stable_count_ = 0;
+      last_successful_K_ = K_new;
+    }
+
+    rate.sleep();
+  }
+
+// Eigen::MatrixXd GimbalLQR::computeOnlineK(const Eigen::MatrixXd& A,
+//                                           const Eigen::MatrixXd& B,
+//                                           const Eigen::MatrixXd& Q,
+//                                           const Eigen::MatrixXd& R) {
+//   // ==== 这里是LQR增益计算核心 ====
+//   // 离散代数Riccati方程解（简化写法，可以换成现成库）
+//   Eigen::MatrixXd P = Q;
+//   for (int i=0; i<50; i++) {
+//     Eigen::MatrixXd K_temp = (B.transpose() * P * B + R).inverse() * (B.transpose() * P * A);
+//     P = Q + A.transpose() * P * (A - B * K_temp);
+//   }
+//   Eigen::MatrixXd K = (B.transpose() * P * B + R).inverse() * (B.transpose() * P * A);
+//   return K;
+  
+  // A << 0., 1., 0., 0.,
+  //      0., -config_.a1_/config_.j1_, 0., config_.dc_/config_.j1_,
+  //      0., 0., 0., 1.,
+  //      0., config_.dc_/config_.j2_, 0., -config_.a2_/config_.j2_;
+
+  // B << 0., 0.,
+  //      1./config_.j1_, 0.,
+  //      0., 0.,
+  //      0., 1./config_.j2_;
+
+  //   Q << config_.q1_,0.,0.,0.,
+  //   0.,config_.q2_,0.,0.,
+  //   0.,0.,config_.q3_,0.,
+  //   0.,0.,0.,config_.q4_;
+
+  //   R << config_.r1_,0.,
+  //        0.,config_.r2_;
+  //   Lqr<double> lqr(A, B, Q, R, K_yaw_);
+  //   if (!lqr.computeK(A, B, Q, R, K_yaw_)) {
+  //     K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
+  //     ROS_WARN("Using default K matrix");
+  //   }
+}
+bool Controller::computeDLQRdiscrete(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
+                           const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
+                           Eigen::MatrixXd& K_out){
+  Eigen::MatrixXd P = Q;
+    Eigen::MatrixXd At = A.transpose(), Bt = B.transpose();
+
+    for (int i=0;i<500;i++){
+      Eigen::MatrixXd S = R + Bt * P * B;
+      if (S.determinant() == 0) return false;
+      Eigen::MatrixXd S_inv = S.inverse();
+      Eigen::MatrixXd Pnext = At * P * A - At * P * B * S_inv * Bt * P * A + Q;
+      if ((Pnext - P).norm() < 1e-9) { P = Pnext; break; }
+      P = Pnext;
+    }
+
+    Eigen::MatrixXd denom = R + Bt * P * B;
+    if (denom.determinant() == 0) return false;
+    K_out = denom.inverse() * Bt * P * A; // m x n
+    return true;
+                           }
+bool Controller::validateK(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& K){
+        // 1) 闭环稳定性（离散系统：模 < 1）
+  Eigen::MatrixXd M = A - B * K;
+  Eigen::EigenSolver<Eigen::MatrixXd> es(M);
+  for (int i=0;i<M.rows();++i) {
+    if (std::abs(es.eigenvalues()[i]) >= 1.0) {
+      ROS_WARN("validateK: closed-loop eigenvalue magnitude >= 1");
+      return false;
+    }
+  }
+  // 2) 幅值测试（用小扰动状态检查控制量大小）
+  for (int i=0;i<5;i++){
+    Eigen::VectorXd xt = Eigen::VectorXd::Random(n_) * 0.1;
+    Eigen::VectorXd utest = -K * xt;
+    if (utest.cwiseAbs().maxCoeff() > u_max_normal_ * 2.0) {
+      ROS_WARN("validateK: control amplitude too large");
+      return false;
+    }
+  }
+  return true;
+    }                      
+double Controller::computeResidual(const Eigen::MatrixXd& Theta_copy){
+    int M = std::min((int)recent_phi_.size(), recent_buffer_len_);
+  if (M < 5) return 1e6;
+  double sumsq = 0.0;
+  for (int i=0;i<M;i++){
+    Eigen::VectorXd pred = Theta_copy * recent_phi_[i];
+    Eigen::VectorXd err = recent_xnext_[i] - pred;
+    sumsq += err.squaredNorm();
+  }
+  return sumsq / (double)M;
+}
+    void Controller::commandCB(const rm_msgs::GimbalCmdConstPtr& msg)
 {
   cmd_rt_buffer_.writeFromNonRT(*msg);
   //ROS_INFO("[Gimbal] Get new command");
@@ -703,7 +925,7 @@ void Controller::trackCB(const rm_msgs::TrackDataConstPtr& msg)
 void Controller::reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t /*unused*/)
 {
   ROS_INFO("[Gimbal Base] Dynamic params change");
-  if (!dynamic_reconfig_initialized_)
+  if (!dynamic_reconfig_initialized_&&!enable_online_lqr)
   {
     GimbalConfig init_config = *config_rt_buffer_.readFromNonRT();  // config init use yaml
     config.yaw_k_v_ = init_config.yaw_k_v_;
@@ -729,8 +951,8 @@ void Controller::reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uin
     // 重新构建矩阵并计算 K
   Eigen::Matrix4d A, B, Q, R;
   // ... 相同构建代码
-  Lqr<double> lqr(A, B, Q, R, K_yaw_);
-  lqr.computeK(A, B, Q, R, K_yaw_);
+  //Lqr<double> lqr(A, B, Q, R, K_yaw_);
+  //lqr.computeK(A, B, Q, R, K_yaw_);
 
   config_rt_buffer_.writeFromNonRT(config_);
   }

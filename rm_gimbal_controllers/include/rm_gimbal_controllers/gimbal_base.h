@@ -165,9 +165,67 @@ public:
     //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
   Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
   Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
+  //RLS
+  int n_; // 状态维度
+  int m_; // 输入维度（外环输出维度）
+  Eigen::MatrixXd Theta_;   // n x (n+m)
+  Eigen::MatrixXd Pcov_;    // (n+m) x (n+m)
+  double lambda_rls_;       // 遗忘因子
+  double P0_scale_;
+
+  std::mutex rls_mutex_;
+  Eigen::VectorXd x_prev_;        // x_k
+  Eigen::VectorXd u_prev_sample_; // u_k (vel_ref)
+  bool have_prev_sample_;
+  size_t sample_count_;
+  std::vector<Eigen::VectorXd> recent_phi_;
+  std::vector<Eigen::VectorXd> recent_xnext_;
+  int recent_buffer_len_;
+  //RLS_END
+
+  //LQR_UPDATE
+  Eigen::MatrixXd K_use_;
+  Eigen::MatrixXd K_current_; // m x n
+  Eigen::MatrixXd K_target_;
+  Eigen::MatrixXd K_old_;
+  std::mutex K_mutex_;
+  std::atomic<bool> switching_;
+  ros::Time switch_start_time_;
+  double switch_smooth_T_;
+  //LQR_UPDATE_END
+
+   // Q, R for discrete LQR (user-tunable)
+  Eigen::MatrixXd Qd_, Rd_;
+
+  // ---------- worker thread ----------
+  std::thread worker_thread_;
+  std::atomic<bool> running_;
+  double worker_hz_;
+  int N_min_samples_;
+  double residual_threshold_;
+  double stable_tol_;
+  int stable_needed_;
+  Eigen::MatrixXd last_successful_K_;
+  int stable_count_;
+
+  // ---------- safety / storage ----------
+  double u_max_normal_;
+  double u_max_;
+  bool driver_saturated_;
+  std::string save_k_path_;
+
+  // ---------- bookkeeping ------------
+  Eigen::VectorXd vel_ref_prev_;
+  Eigen::VectorXd u_prev_out_;
+
+
+  Eigen::Matrix4d A, B, Q, R;
+  Eigen::Matrix4d RLS_A,RLS_B,RLS_Q,RLS_R; 
 
   KalmanFilter kf_yaw_;
   KalmanFilter kf_base_yaw_;
+
+  bool enable_online_lqr;
 
 private:
   void rate(const ros::Time& time, const ros::Duration& period);
@@ -176,6 +234,16 @@ private:
   void traj(const ros::Time& time);
   bool setDesIntoLimit(double& real_des, double current_des, double base2gimbal_current_des,
                        const urdf::JointConstSharedPtr& joint_urdf);
+
+  void onlineLQRUpdate();
+  void updateRLS();
+  bool computeDLQRdiscrete(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
+                           const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
+                           Eigen::MatrixXd& K_out);
+  bool validateK(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& K);
+  double computeResidual(const Eigen::MatrixXd& Theta_copy);
+
+
   void moveJoint(const ros::Time& time, const ros::Duration& period);
   double feedForward(const ros::Time& time);
   void updateChassisVel();
