@@ -163,19 +163,7 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
 
   ramp_rate_pitch_ = new RampFilter<double>(0, 0.001);
   ramp_rate_yaw_ = new RampFilter<double>(0, 0.001);
-
-    //lqr compute
-  // double a_1 = getParam(controller_nh, "b1", 0.1);  // 阻尼系数1，默认0.0
-  // double a_2 = getParam(controller_nh, "b2", 0.1);  // 阻尼系数2，默认0.0
-  // double j_1 = getParam(controller_nh, "j1", 1.0);  // 惯性1，默认1.0
-  // double j_2 = getParam(controller_nh, "j2", 1.0);  // 惯性2，默认1.0
-  // double d_c = getParam(controller_nh, "d_c", 0.0);  // 惯性耦合，默认0.0
-  // double q1 = getParam(controller_nh, "q1", 100.0);  // 状态权重1，默认100.0
-  // double q2 = getParam(controller_nh, "q2", 10.0);   // 状态权重2，默认10.0
-  // double q3 = getParam(controller_nh, "q3", 100.0);  // 状态权重3，默认100.0
-  // double q4 = getParam(controller_nh, "q4", 10.0);   // 状态权重4，默认10.0
-  // double r1 = getParam(controller_nh, "r1", 1.0);    // 输入权重1，默认1.0
-  // double r2 = getParam(controller_nh, "r2", 1.0);    // 输入权重2，默认1.0
+  
   enable_online_lqr = getParam(controller_nh, "enable_online_lqr", false);
 
   kf_yaw_ = KalmanFilter(0.01, 0.1, 0.0, 1.0);
@@ -782,14 +770,43 @@ void Controller::onlineLQRUpdate()
     double residual = computeResidual(Theta_copy);
     if (residual > residual_threshold_) { rate.sleep(); continue; }
 
+    // 添加矩阵维度检查
+    if (Theta_copy.rows() != n_ || Theta_copy.cols() != n_ + m_) {
+      ROS_ERROR("Theta_copy 维度错误: %ldx%ld, 应该为 %dx%d", 
+                Theta_copy.rows(), Theta_copy.cols(), n_, n_+m_);
+      rate.sleep();
+      continue;
+    }
+
     // 分解 Theta -> A_est (n x n), B_est (n x m)
     Eigen::MatrixXd A_est = Theta_copy.block(0, 0, n_, n_);
     Eigen::MatrixXd B_est = Theta_copy.block(0, n_, n_, m_);
 
+    // 验证维度
+    if (A_est.rows() != n_ || A_est.cols() != n_ || B_est.rows() != n_ || B_est.cols() != m_) {
+      ROS_ERROR("A_est 或 B_est 维度错误");
+      rate.sleep();
+      continue;
+    }
+
+    // 确保 Q 和 R 矩阵尺寸正确
+    if (Qd_.rows() != n_ || Qd_.cols() != n_ || Rd_.rows() != m_ || Rd_.cols() != m_) {
+      ROS_ERROR("Q 或 R 矩阵维度错误");
+      Qd_ = Eigen::MatrixXd::Identity(n_, n_);
+      Rd_ = Eigen::MatrixXd::Identity(m_, m_);
+    }
+
     // 计算离散 LQR
-    Eigen::MatrixXd K_new;
+    Eigen::MatrixXd K_new(m_, n_); // 确保 K 初始化为正确维度
     bool ok = computeDLQRdiscrete(A_est, B_est, Qd_, Rd_, K_new);
     if (!ok) { ROS_WARN("DLQR solver failed"); rate.sleep(); continue; }
+
+    // 验证 K_new
+    if (K_new.rows() != m_ || K_new.cols() != n_) {
+      ROS_ERROR("K_new 维度错误: %ldx%ld, 应该为 %dx%d", K_new.rows(), K_new.cols(), m_, n_);
+      rate.sleep();
+      continue;
+    }
 
     // 验证 K_new
     if (!validateK(A_est, B_est, K_new)) { ROS_WARN("K_new validation failed"); rate.sleep(); continue; }
