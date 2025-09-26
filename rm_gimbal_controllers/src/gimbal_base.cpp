@@ -73,10 +73,11 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   ros::NodeHandle nh_bullet_solver = ros::NodeHandle(controller_nh, "bullet_solver");
   bullet_solver_ = std::make_shared<BulletSolver>(nh_bullet_solver);
   ros::NodeHandle nh_yaw = ros::NodeHandle(controller_nh, "yaw");
+  ros::NodeHandle nh_base_yaw = ros::NodeHandle(controller_nh, "base_yaw");
   ros::NodeHandle nh_pitch = ros::NodeHandle(controller_nh, "pitch");
   //ros::NodeHandle nh_pid_yaw_pos = ros::NodeHandle(controller_nh, "yaw/pid_pos");
   ros::NodeHandle nh_pid_pitch_pos = ros::NodeHandle(controller_nh, "pitch/pid_pos");
-  ros::NodeHandle nh_base_yaw = ros::NodeHandle(controller_nh, "base_yaw");
+
 
 
   config_ = { .yaw_k_v_ = getParam(nh_yaw, "k_v", 0.),
@@ -196,6 +197,9 @@ try {
 
 
   Eigen::MatrixXd A(4,4),B(4,2),Q(4,4),R(2,2);
+  n_ = 4;
+  m_ = 2;
+  
 A << 0., 1., 0., 0.,
      0., -config_.a1_/config_.j1_, 0., config_.dc_/config_.j1_,
      0., 0., 0., 1.,
@@ -603,12 +607,12 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   
   // publish state
   //test
-  Eigen::Vector4d x_ref;
+
   x_ref << yaw_des, yaw_vel_des, base_yaw_des, base_yaw_vel_des;
   //ROS_INFO("yaw_vel_des: %lf, pitch_vel_des: %lf", yaw_vel_des, pitch_vel_des);
   Eigen::Vector4d x_err = state_yaw_ - x_ref;
   // x_err(0) = yaw_angle_error;
-  u = -K_yaw_ * x_err;
+  u = -K_current_ * x_err;
   u_yaw = u(0);
   ROS_WARN("K matrix:\n%lf",u(1));
   ROS_WARN("K2 matrix:\n%lf",u(0));
@@ -643,8 +647,6 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   loop_count_++;
   u_yaw = kf_yaw_.update(u(1));  // 对 yaw 输出滤波
 double u_base_yaw = kf_base_yaw_.update(u(0)); 
-  //ROS_INFO("Yaw command: %lf, Pitch command: %lf", u_yaw + 1, pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des + ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
-  //u_yaw = std::clamp(u_yaw, -10.0, 10.0);
   ctrl_yaw_.setCommand(u_yaw);
   ctrl_base_yaw_.setCommand(u_base_yaw);
   ctrl_pitch_.setCommand(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
@@ -654,31 +656,9 @@ double u_base_yaw = kf_base_yaw_.update(u(0));
   ctrl_base_yaw_.update(time, period);
   ctrl_pitch_.update(time, period);
   ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + feedForward(time));
+  updateRLS();
+  onlineLQRUpdate();
 
-  Eigen::VectorXd x(n_);//RLS_input
-  x(0) = ctrl_base_yaw_.joint_.getPosition();
-  x(1) = ctrl_base_yaw_.joint_.getVelocity();
-  x(2) = ctrl_yaw_.joint_.getPosition();
-  x(3) = ctrl_yaw_.joint_.getVelocity();
-//确定是否改变现在使用的K增益
-    Eigen::MatrixXd K_use(2,4);
-  std::lock_guard<std::mutex> lk(K_mutex_);
-    if (switching_) {
-      double t = (ros::Time::now() - switch_start_time_).toSec();
-      double alpha = std::min(1.0, t / switch_smooth_T_);
-      K_use = (1.0 - alpha) * K_old_ + alpha * K_target_;
-      if (alpha >= 1.0) {
-        switching_ = false;
-        K_old_ = K_target_;
-        K_current_ = K_target_;
-        u_max_ = u_max_normal_;
-      }
-    } else {
-      K_use = K_current_;
-    }
-    x_prev_ = x;
-    u_prev_sample_ = vel_ref;
-    have_prev_sample_ = true;
 }
 
 
@@ -722,12 +702,34 @@ void Controller::updateChassisVel()
 
 void Controller::updateRLS()
 {
-  // if (!enable_online_lqr_) return; // 如果禁用，直接返回
-
+  Eigen::VectorXd x(n_);//RLS_input
+  x(0) = ctrl_base_yaw_.joint_.getPosition();
+  x(1) = ctrl_base_yaw_.joint_.getVelocity();
+  x(2) = ctrl_yaw_.joint_.getPosition();
+  x(3) = ctrl_yaw_.joint_.getVelocity();
+  if (!enable_online_lqr) return; // 如果禁用，直接返回
+  Eigen::MatrixXd K_use(m_, n_);
+ std::lock_guard<std::mutex> lk(K_mutex_);
+    if (switching_) {
+      double t = (ros::Time::now() - switch_start_time_).toSec();
+      double alpha = std::min(1.0, t / switch_smooth_T_);
+      K_use = (1.0 - alpha) * K_old_ + alpha * K_target_;
+      if (alpha >= 1.0) {
+        switching_ = false;
+        K_old_ = K_target_;
+        K_current_ = K_target_;
+        u_max_ = u_max_normal_;
+      }
+    } else {
+      K_use = K_current_;
+    }
+    x_prev_ = x;
+    u_prev_sample_ = x_ref;
+    have_prev_sample_ = true;
   // // 在这里可以使用RLS更新A,B（此处省略，给定固定A,B即可）
   // A_ = updateAWithRLS(...);
   // B_ = updateBWithRLS(...);
-  std::lock_guard<std::mutex> lk(rls_mutex_);
+  std::lock_guard<std::mutex> lk_rls(rls_mutex_);
     if (have_prev_sample_ && !driver_saturated_) {
       Eigen::VectorXd phi(n_ + m_);
       phi << x_prev_, u_prev_sample_;
@@ -758,7 +760,7 @@ void Controller::updateRLS()
       sample_count_++;
         // 更新 prev sample: 把现在的 x 和刚下发的 vel_ref 存为下一步的 prev
       x_prev_ = x;
-      u_prev_sample_ = vel_ref;
+      u_prev_sample_ = x_ref;
       have_prev_sample_ = true;
     }
 }
@@ -811,7 +813,7 @@ void Controller::onlineLQRUpdate()
         // during switch make output conservative
         u_max_ = 0.5 * u_max_normal_;
       }
-      saveKToYaml(K_new, save_k_path_);
+      // saveKToYaml(K_new, save_k_path_);
       ROS_INFO("AdaptiveLQR: accepted K_new, scheduled switch and saved.");
       stable_count_ = 0;
       last_successful_K_ = K_new;
@@ -819,43 +821,6 @@ void Controller::onlineLQRUpdate()
 
     rate.sleep();
   }
-
-// Eigen::MatrixXd GimbalLQR::computeOnlineK(const Eigen::MatrixXd& A,
-//                                           const Eigen::MatrixXd& B,
-//                                           const Eigen::MatrixXd& Q,
-//                                           const Eigen::MatrixXd& R) {
-//   // ==== 这里是LQR增益计算核心 ====
-//   // 离散代数Riccati方程解（简化写法，可以换成现成库）
-//   Eigen::MatrixXd P = Q;
-//   for (int i=0; i<50; i++) {
-//     Eigen::MatrixXd K_temp = (B.transpose() * P * B + R).inverse() * (B.transpose() * P * A);
-//     P = Q + A.transpose() * P * (A - B * K_temp);
-//   }
-//   Eigen::MatrixXd K = (B.transpose() * P * B + R).inverse() * (B.transpose() * P * A);
-//   return K;
-  
-  // A << 0., 1., 0., 0.,
-  //      0., -config_.a1_/config_.j1_, 0., config_.dc_/config_.j1_,
-  //      0., 0., 0., 1.,
-  //      0., config_.dc_/config_.j2_, 0., -config_.a2_/config_.j2_;
-
-  // B << 0., 0.,
-  //      1./config_.j1_, 0.,
-  //      0., 0.,
-  //      0., 1./config_.j2_;
-
-  //   Q << config_.q1_,0.,0.,0.,
-  //   0.,config_.q2_,0.,0.,
-  //   0.,0.,config_.q3_,0.,
-  //   0.,0.,0.,config_.q4_;
-
-  //   R << config_.r1_,0.,
-  //        0.,config_.r2_;
-  //   Lqr<double> lqr(A, B, Q, R, K_yaw_);
-  //   if (!lqr.computeK(A, B, Q, R, K_yaw_)) {
-  //     K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
-  //     ROS_WARN("Using default K matrix");
-  //   }
 }
 bool Controller::computeDLQRdiscrete(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
                            const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,

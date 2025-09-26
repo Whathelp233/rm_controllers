@@ -165,6 +165,7 @@ public:
     //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
   Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
   Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
+  Eigen::Vector4d x_ref;
   //RLS
   int n_; // 状态维度
   int m_; // 输入维度（外环输出维度）
