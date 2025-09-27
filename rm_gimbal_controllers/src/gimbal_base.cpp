@@ -209,12 +209,46 @@ B << 0., 0.,
 //  ROS_INFO("A matrix:\n%s", A.toString().c_str());  // 如果 Eigen 支持
   state_yaw_.resize(4);
   state_pitch_.resize(4);
+  x_ref.resize(4);
   Lqr<double> lqr(A,B,Q,R,K_yaw_); 
       if (!lqr.computeK(A, B, Q, R, K_yaw_)) {
         K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
         ROS_WARN("Using default K matrix");
       }
  // K_yaw_ = Eigen::MatrixXd::Zero(2, 4);
+  Theta_ = Eigen::MatrixXd::Zero(n_, n_ + m_);  // 初始化为零矩阵
+  Pcov_ = Eigen::MatrixXd::Identity(n_ + m_, n_ + m_) * 1000.0;  // 初始协方差
+  recent_buffer_len_ = 30;
+  lambda_rls_ = 0.995;  // 遗忘因子
+  K_current_ = K_yaw_;  // 初始使用 K_yaw_
+
+  u_prev_sample_.resize(m_);
+  x_prev_.resize(n_);
+  state_yaw_.resize(4);
+  state_pitch_.resize(4);
+  x_ref.resize(4);
+  Qd_ = Q;  // 使用与初始LQR相同的权重矩阵
+  Rd_ = R;
+  last_successful_K_ = K_yaw_;  // 初始化为计算的LQR增益
+  K_current_ = K_yaw_;
+  K_old_ = K_yaw_;
+  K_target_ = K_yaw_;
+  running_ = true;
+  worker_hz_ = 2;  // 10Hz更新频率
+  switch_smooth_T_ = 1.0;  // 平滑过渡时间1秒
+  stable_needed_ = 5;
+  stable_count_ = 0;
+  stable_tol_ = 0.05;
+  u_max_normal_ = 20.0;
+  u_max_ = u_max_normal_;
+  N_min_samples_ = 200; // 增加样本数量确保模型收敛
+  //excitation_amplitude_ = 0.05;  // 小扰动幅度
+  //use_excitation_ = true;       // 启用扰动
+
+  switching_ = false;
+  if (enable_online_lqr) {
+  worker_thread_ = std::thread(&Controller::onlineLQRUpdate, this);
+}
   ROS_INFO("Initializing gimbal controller...");
 } catch (const std::exception& e) {
   ROS_ERROR("Exception in init: %s", e.what());
@@ -222,30 +256,6 @@ B << 0., 0.,
 }   
   return true;
 }
-// bool Controller::computeLQR(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, Eigen::MatrixXd& K) {
-//   try {
-//     // 检查矩阵有效性
-//     if (!A.allFinite() || !B.allFinite() || !Q.allFinite() || !R.allFinite()) {
-//       ROS_ERROR("LQR matrices contain NaN or Inf");
-//       return false;
-//     }
-
-//     // 计算 P
-//     Eigen::MatrixXd P = solveRiccatiIterative(A, B, Q, R);
-//     if (P.rows() == 0 || P.cols() == 0) {
-//       ROS_ERROR("Riccati computation failed");
-//       return false;
-//     }
-
-//     // 正确的 LQR 增益公式：K = R^{-1} B^T P
-//     K = R.inverse() * B.transpose() * P;
-//     ROS_INFO("LQR K matrix computed successfully: %ldx%ld", K.rows(), K.cols());
-//     return true;
-//   } catch (const std::exception& e) {
-//     ROS_ERROR("Exception in computeLQR: %s", e.what());
-//     return false;
-//   }
-// }
 void Controller::starting(const ros::Time& /*unused*/)
 {
   state_ = RATE;
@@ -533,6 +543,7 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   quatToRPY(odom2gimbal_des_.transform.rotation, roll_des, pitch_des, yaw_des);
   quatToRPY(odom2pitch_.transform.rotation, roll_real, pitch_real, yaw_real);
   quatToRPY(odom2base_yaw_.transform.rotation, roll_real, pitch_real, base_yaw_real);
+
   //double yaw_angle_error = angles::shortest_angular_distance(yaw_real, yaw_des);
 
   double pitch_angle_error = angles::shortest_angular_distance(pitch_real, pitch_des);
@@ -541,8 +552,10 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   // LQR control
       yaw_real = angles::normalize_angle_positive(yaw_real);
       yaw_des = angles::normalize_angle_positive(yaw_des);
+      base_yaw_real = angles::normalize_angle_positive(base_yaw_real);
+      base_yaw_des = yaw_des;
       state_yaw_ << yaw_real, angular_vel_yaw.z, base_yaw_real, angular_vel_base_yaw.z;
-      Eigen::VectorXd u = -K_yaw_ * state_yaw_;
+      u = -K_yaw_ * state_yaw_;
       //ROS_INFO("State: [%.2f, %.2f, %.2f, %.2f], Command: [%.2f, %.2f]", state_yaw_(0), state_yaw_(1), state_yaw_(2), state_yaw_(3), u(0), u(1));
       double u_yaw = u(0);
      
@@ -633,8 +646,15 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
     }
   }
   loop_count_++;
-  u_yaw = kf_yaw_.update(u(1));  // 对 yaw 输出滤波
-double u_base_yaw = kf_base_yaw_.update(u(0)); 
+  double yaw_pos = ctrl_yaw_.joint_.getPosition();
+  double base_yaw_pos = ctrl_base_yaw_.joint_.getPosition();
+
+// 计算角度差
+  double sync_gain = -0.3;  // 同步增益，可调
+  double angle_diff = angles::shortest_angular_distance(yaw_pos, base_yaw_pos);
+  u_yaw = kf_yaw_.update(u(0));  // 对 yaw 输出滤波
+double u_base_yaw = kf_base_yaw_.update(u(1)+ sync_gain * angle_diff);  // 对 base_yaw 输出滤波并加入同步控制
+
   ctrl_yaw_.setCommand(u_yaw);
   ctrl_base_yaw_.setCommand(u_base_yaw);
   ctrl_pitch_.setCommand(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
@@ -645,7 +665,7 @@ double u_base_yaw = kf_base_yaw_.update(u(0));
   ctrl_pitch_.update(time, period);
   ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + feedForward(time));
   updateRLS();
-  onlineLQRUpdate();
+  // onlineLQRUpdate();
 
 }
 
@@ -690,154 +710,159 @@ void Controller::updateChassisVel()
 
 void Controller::updateRLS()
 {
-  Eigen::VectorXd x(n_);//RLS_input
-  x(0) = ctrl_base_yaw_.joint_.getPosition();
-  x(1) = ctrl_base_yaw_.joint_.getVelocity();
-  x(2) = ctrl_yaw_.joint_.getPosition();
-  x(3) = ctrl_yaw_.joint_.getVelocity();
-  if (!enable_online_lqr) return; // 如果禁用，直接返回
-  Eigen::MatrixXd K_use(m_, n_);
- std::lock_guard<std::mutex> lk(K_mutex_);
+  // 构建当前状态向量（确保顺序一致）
+  Eigen::VectorXd x(n_);
+  x(0) = ctrl_yaw_.joint_.getPosition();
+  x(1) = ctrl_yaw_.joint_.getVelocity();
+  x(2) = ctrl_base_yaw_.joint_.getPosition();
+  x(3) = ctrl_base_yaw_.joint_.getVelocity();
+  
+  if (!enable_online_lqr) return;
+  
+  // 一次性处理K矩阵平滑过渡
+  {
+    std::lock_guard<std::mutex> lk(K_mutex_);
     if (switching_) {
       double t = (ros::Time::now() - switch_start_time_).toSec();
       double alpha = std::min(1.0, t / switch_smooth_T_);
-      K_use = (1.0 - alpha) * K_old_ + alpha * K_target_;
+      K_current_ = (1.0 - alpha) * K_old_ + alpha * K_target_;
       if (alpha >= 1.0) {
         switching_ = false;
         K_old_ = K_target_;
-        K_current_ = K_target_;
         u_max_ = u_max_normal_;
       }
-    } else {
-      K_use = K_current_;
     }
-    x_prev_ = x;
-    u_prev_sample_ = x_ref;
-    have_prev_sample_ = true;
-  // // 在这里可以使用RLS更新A,B（此处省略，给定固定A,B即可）
-  // A_ = updateAWithRLS(...);
-  // B_ = updateBWithRLS(...);
-  std::lock_guard<std::mutex> lk_rls(rls_mutex_);
+  }
+  
+  // 处理RLS更新
+  {
+    std::lock_guard<std::mutex> lk_rls(rls_mutex_);
+    
+    // 只有在有前一个样本且执行器未饱和时更新
     if (have_prev_sample_ && !driver_saturated_) {
+      // 安全检查
+      if (x_prev_.size() != n_ || u_prev_sample_.size() != m_) {
+        ROS_ERROR_THROTTLE(1.0, "维度错误: x_prev_(%ld) != n_(%d) 或 u_prev_sample_(%ld) != m_(%d)",
+                 x_prev_.size(), n_, u_prev_sample_.size(), m_);
+        x_prev_.resize(n_);
+        u_prev_sample_.resize(m_);
+        return;
+      }
+      
+      // 构建回归向量
       Eigen::VectorXd phi(n_ + m_);
       phi << x_prev_, u_prev_sample_;
-
-      // RLS 增益
+      
+      // RLS更新
       Eigen::VectorXd Pphi = Pcov_ * phi;
       double denom = lambda_rls_ + phi.dot(Pphi);
       if (denom < 1e-12) denom = 1e-12;
-      Eigen::VectorXd Kk = Pphi / denom; // (n+m) x 1
-
-      // 预测与误差
-      Eigen::VectorXd pred = Theta_ * phi; // n x 1
+      Eigen::VectorXd Kk = Pphi / denom;
+      Eigen::VectorXd pred = Theta_ * phi;
       Eigen::VectorXd err = x - pred;
-
-      // 更新 Theta 与 Pcov
+      
+      // 更新参数和协方差
       Theta_ += err * Kk.transpose();
       Pcov_ = (Pcov_ - Kk * (phi.transpose() * Pcov_)) / lambda_rls_;
-      Pcov_ = 0.5 * (Pcov_ + Pcov_.transpose());
-
-      // 存入 recent buffer 用于 residual 计算
-      if ((int)recent_phi_.size() >= recent_buffer_len_) {
+      Pcov_ = 0.5 * (Pcov_ + Pcov_.transpose());  // 确保对称性
+      
+      // 维护最近样本窗口
+      if (recent_phi_.size() >= (size_t)recent_buffer_len_) {
         recent_phi_.erase(recent_phi_.begin());
         recent_xnext_.erase(recent_xnext_.begin());
       }
       recent_phi_.push_back(phi);
       recent_xnext_.push_back(x);
-
       sample_count_++;
-        // 更新 prev sample: 把现在的 x 和刚下发的 vel_ref 存为下一步的 prev
-      x_prev_ = x;
-      u_prev_sample_ = x_ref;
-      have_prev_sample_ = true;
     }
+    
+    // 更新前一个状态和输入
+    x_prev_ = x;
+    u_prev_sample_.resize(m_);  // 确保正确维度
+    u_prev_sample_(0) = ctrl_yaw_.joint_.getCommand();;  // 速度作为输入
+    u_prev_sample_(1) = ctrl_base_yaw_.joint_.getCommand();
+    have_prev_sample_ = true;
+  }
 }
 void Controller::onlineLQRUpdate()
 {
-  if(enable_online_lqr==false)
-    return;
+  if (!enable_online_lqr) return;
+  
   ros::Rate rate(worker_hz_);
+  
+  // 添加状态变量监控日志
+  ROS_INFO("自适应LQR线程启动: 采样率=%d Hz", worker_hz_);
+  
   while (ros::ok() && running_) {
-    Eigen::MatrixXd Theta_copy;
-    {
-      std::lock_guard<std::mutex> lk(rls_mutex_);
-      Theta_copy = Theta_;
-    }
-
-    if (sample_count_ < (size_t)N_min_samples_) { rate.sleep(); continue; }
-
-    // 计算 residual（用最近窗口）
-    double residual = computeResidual(Theta_copy);
-    if (residual > residual_threshold_) { rate.sleep(); continue; }
-
-    // 添加矩阵维度检查
-    if (Theta_copy.rows() != n_ || Theta_copy.cols() != n_ + m_) {
-      ROS_ERROR("Theta_copy 维度错误: %ldx%ld, 应该为 %dx%d", 
-                Theta_copy.rows(), Theta_copy.cols(), n_, n_+m_);
-      rate.sleep();
-      continue;
-    }
-
-    // 分解 Theta -> A_est (n x n), B_est (n x m)
-    Eigen::MatrixXd A_est = Theta_copy.block(0, 0, n_, n_);
-    Eigen::MatrixXd B_est = Theta_copy.block(0, n_, n_, m_);
-
-    // 验证维度
-    if (A_est.rows() != n_ || A_est.cols() != n_ || B_est.rows() != n_ || B_est.cols() != m_) {
-      ROS_ERROR("A_est 或 B_est 维度错误");
-      rate.sleep();
-      continue;
-    }
-
-    // 确保 Q 和 R 矩阵尺寸正确
-    if (Qd_.rows() != n_ || Qd_.cols() != n_ || Rd_.rows() != m_ || Rd_.cols() != m_) {
-      ROS_ERROR("Q 或 R 矩阵维度错误");
-      Qd_ = Eigen::MatrixXd::Identity(n_, n_);
-      Rd_ = Eigen::MatrixXd::Identity(m_, m_);
-    }
-
-    // 计算离散 LQR
-    Eigen::MatrixXd K_new(m_, n_); // 确保 K 初始化为正确维度
-    bool ok = computeDLQRdiscrete(A_est, B_est, Qd_, Rd_, K_new);
-    if (!ok) { ROS_WARN("DLQR solver failed"); rate.sleep(); continue; }
-
-    // 验证 K_new
-    if (K_new.rows() != m_ || K_new.cols() != n_) {
-      ROS_ERROR("K_new 维度错误: %ldx%ld, 应该为 %dx%d", K_new.rows(), K_new.cols(), m_, n_);
-      rate.sleep();
-      continue;
-    }
-
-    // 验证 K_new
-    if (!validateK(A_est, B_est, K_new)) { ROS_WARN("K_new validation failed"); rate.sleep(); continue; }
-
-    // 稳定性检查：需要连续 stable_needed_ 次差异小才接受
-    double diff = (K_new - last_successful_K_).norm();
-    if (last_successful_K_.size() == 0) {
-      last_successful_K_ = K_new;
-      stable_count_ = 1;
-    } else {
-      if (diff < stable_tol_) stable_count_++; else { stable_count_ = 1; last_successful_K_ = K_new; }
-    }
-
-    if (stable_count_ >= stable_needed_) {
-      // schedule smooth switch
+    try {
+      // 获取Theta矩阵副本
+      Eigen::MatrixXd Theta_copy;
       {
-        std::lock_guard<std::mutex> lk(K_mutex_);
-        K_target_ = K_new;
-        switching_ = true;
-        switch_start_time_ = ros::Time::now();
-        // during switch make output conservative
-        u_max_ = 0.5 * u_max_normal_;
+        std::lock_guard<std::mutex> lk(rls_mutex_);
+        if (sample_count_ < (size_t)N_min_samples_) {
+          rate.sleep();
+          continue;
+        }
+        Theta_copy = Theta_;
       }
-      // saveKToYaml(K_new, save_k_path_);
-      ROS_INFO("AdaptiveLQR: accepted K_new, scheduled switch and saved.");
-      stable_count_ = 0;
-      last_successful_K_ = K_new;
+      
+      // 安全检查
+      if (!Theta_copy.allFinite() || Theta_copy.rows() != n_ || Theta_copy.cols() != n_ + m_) {
+        ROS_WARN_THROTTLE(5.0, "Theta矩阵无效或维度错误: %ldx%ld", Theta_copy.rows(), Theta_copy.cols());
+        rate.sleep();
+        continue;
+      }
+      
+      // 分解Theta矩阵
+      Eigen::MatrixXd A_est = Theta_copy.block(0, 0, n_, n_);
+      Eigen::MatrixXd B_est = Theta_copy.block(0, n_, n_, m_);
+      
+      // 计算控制增益
+      Eigen::MatrixXd K_new(m_, n_);
+      bool ok = computeDLQRdiscrete(A_est, B_est, Qd_, Rd_, K_new);
+      
+      if (!ok || !K_new.allFinite() || !validateK(A_est, B_est, K_new)) {
+        ROS_WARN_THROTTLE(5.0, "LQR计算失败或验证失败");
+        rate.sleep();
+        continue;
+      }
+      if (!ok || !K_new.allFinite() || K_new.norm() < 0.1) {
+          ROS_WARN("LQR计算失败或K接近零，使用初始K矩阵");
+          K_new = K_yaw_;  // 使用初始K矩阵
+        }
+      // 平稳过渡逻辑
+      double diff = (K_new - last_successful_K_).norm();
+      if (last_successful_K_.rows() == 0) {
+        last_successful_K_ = K_new;
+        stable_count_ = 1;
+      } else if (diff < stable_tol_) {
+        stable_count_++;
+      } else {
+        stable_count_ = 1;
+        last_successful_K_ = K_new;
+      }
+      
+      if (stable_count_ >= stable_needed_) {
+        {
+          std::lock_guard<std::mutex> lk(K_mutex_);
+          K_target_ = K_new;
+          switching_ = true;
+          switch_start_time_ = ros::Time::now();
+          u_max_ = 0.5 * u_max_normal_;
+        }
+        ROS_INFO("自适应LQR: 新增益已接受并调度平滑切换");
+        stable_count_ = 0;
+        last_successful_K_ = K_new;
+      }
+      
+    } catch (const std::exception& e) {
+      ROS_ERROR("自适应LQR异常: %s", e.what());
     }
-
+    
     rate.sleep();
   }
+  
+  ROS_INFO("自适应LQR线程终止");
 }
 bool Controller::computeDLQRdiscrete(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
                            const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,

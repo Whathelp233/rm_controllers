@@ -166,6 +166,7 @@ public:
   Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
   Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
   Eigen::Vector4d x_ref;
+  Eigen::VectorXd u;
   //RLS
   int n_; // 状态维度
   int m_; // 输入维度（外环输出维度）
@@ -201,7 +202,7 @@ public:
   // ---------- worker thread ----------
   std::thread worker_thread_;
   std::atomic<bool> running_;
-  double worker_hz_;
+  int worker_hz_;
   int N_min_samples_;
   double residual_threshold_;
   double stable_tol_;
