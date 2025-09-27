@@ -56,6 +56,7 @@
 #include <urdf/model.h>
 #include <dynamic_reconfigure/server.h>
 #include <realtime_tools/realtime_publisher.h>
+#include <std_msgs/Float64MultiArray.h>
 
 namespace rm_gimbal_controllers
 {
@@ -244,7 +245,8 @@ private:
                            Eigen::MatrixXd& K_out);
   bool validateK(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& K);
   double computeResidual(const Eigen::MatrixXd& Theta_copy);
-
+  void resetThetaToDefault();
+  void applyPhysicalConstraints();
 
   void moveJoint(const ros::Time& time, const ros::Duration& period);
   double feedForward(const ros::Time& time);
@@ -305,7 +307,7 @@ private:
   bool pitch_des_in_limit_{}, yaw_des_in_limit_{};
   int loop_count_{};
 
-
+  ros::Publisher k_matrix_pub_;
 
 
   // Transform
