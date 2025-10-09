@@ -35,6 +35,7 @@
 // Created by qiayuan on 1/16/21.
 //
         
+#pragma once
 
 #include <effort_controllers/joint_velocity_controller.h>
 #include <effort_controllers/joint_effort_controller.h>
@@ -57,6 +58,92 @@
 #include <dynamic_reconfigure/server.h>
 #include <realtime_tools/realtime_publisher.h>
 #include <std_msgs/Float64MultiArray.h>
+
+// ...existing code...
+
+template<typename T>
+class NonlinearTrackingDifferentiator {
+public:
+  NonlinearTrackingDifferentiator(T r, T h, T x1_limit = 1e6, T x2_limit = 1e6) 
+    : r_(r), h_(h), x1_(0), x2_(0), x1_limit_(x1_limit), x2_limit_(x2_limit) {}
+  
+  void update(T v, T v_dot_expected = 0) {
+    // ✅ 使用兼容 C++11/14 的 clamp 实现
+    T v_clamped = clamp(v, -x1_limit_, x1_limit_);
+    T v_dot_clamped = clamp(v_dot_expected, -x2_limit_, x2_limit_);
+    
+    T fh = fhan(x1_ - v_clamped, x2_ - v_dot_clamped, r_, h_);
+    
+    x1_ += h_ * x2_;
+    x2_ += h_ * fh;
+    
+    // 输出限幅
+    x1_ = clamp(x1_, -x1_limit_, x1_limit_);
+    x2_ = clamp(x2_, -x2_limit_, x2_limit_);
+  }
+  
+  T getX1() const { return x1_; }
+  T getX2() const { return x2_; }
+  
+  void reset(T x1 = 0, T x2 = 0) {
+    x1_ = clamp(x1, -x1_limit_, x1_limit_);
+    x2_ = clamp(x2, -x2_limit_, x2_limit_);
+  }
+  
+  void setLimits(T x1_limit, T x2_limit) {
+    x1_limit_ = x1_limit;
+    x2_limit_ = x2_limit;
+  }
+  
+private:
+  // ✅ 添加：兼容 C++11/14 的 clamp 函数
+  T clamp(T value, T min_val, T max_val) const {
+    return std::max(min_val, std::min(value, max_val));
+  }
+  
+  T fhan(T x1, T x2, T r, T h) {
+    constexpr T epsilon = 1e-10;
+    T d = r * h * h;
+    
+    if (d < epsilon) {
+      return -r * sign(x1);
+    }
+    
+    T a0 = h * x2;
+    T y = x1 + a0;
+    T abs_y = std::abs(y);
+    
+    if (abs_y < epsilon) {
+      return -r * sign(a0);
+    }
+    
+    T a1 = std::sqrt(d * (d + 8 * abs_y));
+    T a2 = a0 + (y >= 0 ? 1 : -1) * (a1 - d) / 2;
+    T sy = (sign(y + d) - sign(y - d)) / 2;
+    T a = (a0 + y - a2) * sy + a2;
+    T sa = (sign(a + d) - sign(a - d)) / 2;
+    
+    return -r * (a / d - sign(a)) * sa - r * sign(a);
+  }
+  
+  T sign(T x) const {
+    if (x > epsilon_) return 1;
+    if (x < -epsilon_) return -1;
+    return 0;
+  }
+  
+  static constexpr T epsilon_ = 1e-10;
+  
+  T r_;          // 速度因子
+  T h_;          // 采样时间
+  T x1_;         // 跟踪信号
+  T x2_;         // 微分信号
+  T x1_limit_;   // 位置限幅
+  T x2_limit_;   // 速度限幅
+};
+
+// ...existing code...
+
 
 namespace rm_gimbal_controllers
 {
@@ -88,6 +175,7 @@ public:
 private:
   double x_, P_, Q_, R_;
 };
+
 class ChassisVel
 {
 public:
@@ -157,15 +245,56 @@ class Controller : public controller_interface::MultiInterfaceController<rm_cont
 {
 public:
   Controller() = default;
+  ~Controller();
   bool init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& root_nh, ros::NodeHandle& controller_nh) override;
   void starting(const ros::Time& time) override;
   void update(const ros::Time& time, const ros::Duration& period) override;
   void setDes(const ros::Time& time, double yaw_des, double pitch_des);
+  bool loadKFromYaml(const std::string& path, Eigen::MatrixXd& K_out);
+  void stopping(const ros::Time& time) override;
+  
 
+private:
+  void rate(const ros::Time& time, const ros::Duration& period);
+  void track(const ros::Time& time);
+  void direct(const ros::Time& time);
+  void traj(const ros::Time& time);
+  bool setDesIntoLimit(double& real_des, double current_des, double base2gimbal_current_des,
+                       const urdf::JointConstSharedPtr& joint_urdf);
 
-    //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
-  Eigen::MatrixXd K_yaw_, K_pitch_;     // LQR增益矩阵
-  Eigen::VectorXd state_yaw_, state_pitch_;  // 状态向量
+  void onlineLQRUpdate();
+  void updateRLS();
+  bool computeDLQRdiscrete(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
+                           const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
+                           Eigen::MatrixXd& K_out);
+  bool validateK(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& K);
+  bool validateKFast(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, 
+                               const Eigen::MatrixXd& K);
+  bool computeDLQRdiscreteFast(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
+                                         const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
+                                         Eigen::MatrixXd& K_out);
+  double computeResidual(const Eigen::MatrixXd& Theta_copy);
+  void resetThetaToDefault();
+  void applyPhysicalConstraints();
+
+  void saveKToYaml(const Eigen::MatrixXd& K, const std::string& path);
+
+  void moveJoint(const ros::Time& time, const ros::Duration& period);
+  double feedForward(const ros::Time& time);
+  void updateChassisVel();
+  void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
+  void trackCB(const rm_msgs::TrackDataConstPtr& msg);
+  void reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t);
+  void updateStrategy(double current_error);
+
+  bool computeDLQRdiscretePrecise(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
+                                   const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
+                                   Eigen::MatrixXd& K_out);
+
+  //LQR
+  //Lqr lqr_yaw_, lqr_pitch_;  // 或自定义LQR类
+  Eigen::MatrixXd K_yaw_;     // LQR增益矩阵
+  Eigen::VectorXd state_yaw_;  // 状态向量
   Eigen::Vector4d x_ref;
   Eigen::VectorXd u;
   //RLS
@@ -174,7 +303,6 @@ public:
   Eigen::MatrixXd Theta_;   // n x (n+m)
   Eigen::MatrixXd Pcov_;    // (n+m) x (n+m)
   double lambda_rls_;       // 遗忘因子
-  double P0_scale_;
 
   std::mutex rls_mutex_;
   Eigen::VectorXd x_prev_;        // x_k
@@ -184,6 +312,11 @@ public:
   std::vector<Eigen::VectorXd> recent_phi_;
   std::vector<Eigen::VectorXd> recent_xnext_;
   int recent_buffer_len_;
+
+  double u_yaw_cmd_;      // 保存yaw速度命令
+  double u_base_yaw_cmd_; // 保存base_yaw速度命令
+  double u_yaw_;          // 最终yaw速度命令
+  double u_base_yaw_;     // 最终base_yaw速度命令
   //RLS_END
 
   //LQR_UPDATE
@@ -222,61 +355,17 @@ public:
   Eigen::VectorXd u_prev_out_;
 
 
-  Eigen::Matrix4d A, B, Q, R;
-  Eigen::Matrix4d RLS_A,RLS_B,RLS_Q,RLS_R; 
+  Eigen::MatrixXd system_matrix_a_;   
+  Eigen::MatrixXd control_matrix_b_;    
+  Eigen::MatrixXd state_weight_q_;      
+  Eigen::MatrixXd control_weight_r_;    
 
   KalmanFilter kf_yaw_;
   KalmanFilter kf_base_yaw_;
 
-  bool enable_online_lqr;
+  bool enable_online_lqr_;
 
-private:
-  void rate(const ros::Time& time, const ros::Duration& period);
-  void track(const ros::Time& time);
-  void direct(const ros::Time& time);
-  void traj(const ros::Time& time);
-  bool setDesIntoLimit(double& real_des, double current_des, double base2gimbal_current_des,
-                       const urdf::JointConstSharedPtr& joint_urdf);
-
-  void onlineLQRUpdate();
-  void updateRLS();
-  bool computeDLQRdiscrete(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
-                           const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
-                           Eigen::MatrixXd& K_out);
-  bool validateK(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& K);
-  double computeResidual(const Eigen::MatrixXd& Theta_copy);
-  void resetThetaToDefault();
-  void applyPhysicalConstraints();
-
-  void moveJoint(const ros::Time& time, const ros::Duration& period);
-  double feedForward(const ros::Time& time);
-  void updateChassisVel();
-  void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
-  void trackCB(const rm_msgs::TrackDataConstPtr& msg);
-  void reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t);
-  
-  //lqr_test
-  // Eigen::MatrixXd solveRiccatiIterative(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, int max_iter = 100, double tol = 1e-6) {
-  //   Eigen::MatrixXd P = Q;  // 初始 P = Q
-  //   Eigen::MatrixXd P_prev;
-
-  //   for (int iter = 0; iter < max_iter; ++iter) {
-  //     P_prev = P;
-  //     Eigen::MatrixXd BRB = B.transpose() * P * B + R;
-  //     Eigen::MatrixXd BRB_inv = BRB.inverse();
-  //     P = A.transpose() * P * A - A.transpose() * P * B * BRB_inv * B.transpose() * P * A + Q;
-
-  //     // 检查收敛
-  //     if ((P - P_prev).norm() < tol) {
-  //       ROS_INFO("Riccati converged in %d iterations", iter + 1);
-  //       break;
-  //     }
-  //   }
-  //   return P;
-  // }
-
-  //bool computeLQR(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, Eigen::MatrixXd& K);
-
+  //LQR END
   rm_control::RobotStateHandle robot_state_handle_;
   hardware_interface::ImuSensorHandle imu_sensor_handle_;
   bool has_imu_ = true;
@@ -337,6 +426,107 @@ private:
   };
   int state_ = RATE;
   bool start_ = false;
+
+    enum UpdateStrategy {
+    STRATEGY_INITIAL,      // 初始学习：保守
+    STRATEGY_NORMAL,       // 正常运行：平衡
+    STRATEGY_QUICK,        // 快速适应：激进
+    STRATEGY_STABLE        // 已稳定：精细调整
+  };
+
+  std::deque<double> yaw_vel_history_;
+  std::deque<double> base_yaw_vel_history_;
+  std::deque<double> pitch_vel_history_;
+  static constexpr int kVelFilterSize = 5;  // 5点移动平均
+  
+  // ✅ 添加：速度低通滤波器
+  double yaw_vel_filtered_{0.0};
+  double base_yaw_vel_filtered_{0.0};
+  double pitch_vel_filtered_{0.0};
+  static constexpr double kVelFilterAlpha = 0.3;  // 截止频率约50Hz
+  
+  UpdateStrategy update_strategy_{STRATEGY_INITIAL};
+  double recent_avg_error_{0.0};
+  std::deque<double> error_window_;
+  int successful_updates_{0};
+  
+  std::unique_ptr<NonlinearTrackingDifferentiator<double>> td_yaw_;
+  std::unique_ptr<NonlinearTrackingDifferentiator<double>> td_base_yaw_;
 };
 
+// 替换第 365 行开始的 namespace constants 部分
+
+namespace constants {
+
+// ==================== Kalman Filter ====================
+constexpr double kKalmanProcessNoise = 0.005;
+constexpr double kKalmanMeasurementNoise = 0.3;
+constexpr double kKalmanInitialEstimate = 0.0;
+constexpr double kKalmanInitialError = 1.0;
+
+// ==================== RLS Parameters ====================
+constexpr double kRlsMinDenominator = 1e-6;
+constexpr double kRlsMaxErrorNorm = 10.0;
+constexpr double kRlsMaxDeltaNorm = 0.05;
+constexpr int kRlsMinSamples = 200;
+constexpr int kRlsBufferLength = 200;
+
+// ==================== Control Limits ====================
+constexpr double kMaxControlCommand = 15.0;
+constexpr double kMaxControlMultiplier = 2.0;
+
+// ==================== LQR Parameters ====================
+constexpr int kLqrMaxIterations = 500;
+constexpr double kLqrConvergenceTolerance = 1e-9;
+constexpr double kMinDeterminant = 1e-10;
+constexpr double kMinKNorm = 0.1;
+constexpr double kEigenvalueStabilityThreshold = 1.0;
+
+// ==================== Adaptive Smoothing ====================
+constexpr int kErrorHistorySize = 10;
+constexpr double kErrorVarianceThreshold = 0.01;
+constexpr double kAlphaHigh = 0.95;
+constexpr double kAlphaLow = 0.85;
+
+// ==================== Theta Initialization ====================
+constexpr double kThetaPositionIntegral = 1.0;
+constexpr double kThetaVelocityDecay = 0.98;
+constexpr double kThetaInputGain = 0.8;
+constexpr double kThetaCouplingStrength = 0.01;
+constexpr double kThetaCovarianceInit = 1.0;
+
+// ==================== Physical Constraints ====================
+constexpr double kMinVelocityDecay = 0.85;
+constexpr double kMaxVelocityDecay = 0.995;
+constexpr double kDefaultVelocityDecay = 0.95;
+constexpr double kDefaultInputGain = 0.8;
+constexpr double kMinInputGain = 0.1;
+constexpr double kMaxInputGain = 10.0;
+constexpr double kMaxCouplingStrength = 0.15;
+
+// ==================== Timing ====================
+constexpr double kWorkerThreadStartupDelay = 2.0;
+constexpr double kDestructorJoinTimeout = 5.0;
+constexpr int kStatusPublishInterval = 10;
+constexpr int kSampleProgressInterval = 50;
+
+// ==================== Validation ====================
+constexpr int kValidationTestCount = 5;
+constexpr double kValidationStateScale = 0.1;
+constexpr int kMinResidualSamples = 5;
+constexpr double kMaxResidualValue = 1e6;
+
+// ==================== Adaptive Update Strategy ====================
+constexpr int kRlsMinSamplesInitial = 100;
+constexpr int kRlsMinSamplesNormal = 50;
+constexpr int kRlsMinSamplesQuick = 20;
+
+constexpr int kWorkerHzInitial = 2;
+constexpr int kWorkerHzNormal = 5;
+constexpr int kWorkerHzQuick = 10;
+
+constexpr double kLargeErrorThreshold = 0.1;
+constexpr double kSmallErrorThreshold = 0.01;
+
+}  // namespace constants
 }  // namespace rm_gimbal_controllers
