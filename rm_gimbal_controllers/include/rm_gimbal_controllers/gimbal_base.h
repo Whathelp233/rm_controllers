@@ -317,6 +317,8 @@ private:
   double u_base_yaw_cmd_; // 保存base_yaw速度命令
   double u_yaw_;          // 最终yaw速度命令
   double u_base_yaw_;     // 最终base_yaw速度命令
+  double imu_yaw_vel_;
+  double imu_base_yaw_vel_;
   //RLS_END
 
   //LQR_UPDATE

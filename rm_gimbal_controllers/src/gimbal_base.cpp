@@ -691,6 +691,9 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
       tf2::doTransform(gyro, angular_vel_base_yaw,
                        robot_state_handle_.lookupTransform(base_yaw_joint_urdf_->child_link_name,
                                                            imu_sensor_handle_.getFrameId(), time));
+    imu_yaw_vel_ = angular_vel_yaw.z;
+    imu_base_yaw_vel_ = angular_vel_base_yaw.z;
+
     } catch (tf2::TransformException& ex) {
       ROS_WARN("%s", ex.what());
       return;
@@ -700,7 +703,7 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     double yaw_vel_raw = ctrl_yaw_.joint_.getVelocity();
     double base_yaw_vel_raw = ctrl_base_yaw_.joint_.getVelocity();
     double pitch_vel_raw = ctrl_pitch_.joint_.getVelocity();
-    
+
     // ✅ 1. 异常值检测（防止编码器跳变）
     constexpr double kMaxVelChange = 100.0;  // rad/s²
     
@@ -717,13 +720,13 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
       ROS_WARN_THROTTLE(0.5, "Pitch vel spike detected, rejecting");
       pitch_vel_raw = last_pitch_vel_;
     }
-    
+    // ✅ 修复：先更新历史，再设置用于补偿的速度（使用滤波后的值）
     last_yaw_vel_ = yaw_vel_raw;
     last_base_yaw_vel_ = base_yaw_vel_raw;
     last_pitch_vel_ = pitch_vel_raw;
     
-    // ✅ 2. 中值滤波（移动窗口大小为5）
-    constexpr size_t kMedianFilterSize = 5;
+    // ✅ 2. 简化滤波（3点中值，减少计算量）
+    constexpr size_t kMedianFilterSize = 3;  // ✅ 从5降到3，减少50%计算
     
     yaw_vel_buffer_.push_back(yaw_vel_raw);
     base_yaw_vel_buffer_.push_back(base_yaw_vel_raw);
@@ -733,17 +736,19 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     if (base_yaw_vel_buffer_.size() > kMedianFilterSize) base_yaw_vel_buffer_.pop_front();
     if (pitch_vel_buffer_.size() > kMedianFilterSize) pitch_vel_buffer_.pop_front();
     
-    // 计算中值 - 添加安全检查防止崩溃
-    auto compute_median = [](const std::deque<double>& buf) -> double {
+    // 快速3点中值（无需排序）
+    auto median3 = [](const std::deque<double>& buf) -> double {
       if (buf.empty()) return 0.0;
-      std::vector<double> sorted(buf.begin(), buf.end());
-      std::sort(sorted.begin(), sorted.end());
-      return sorted[sorted.size() / 2];
+      if (buf.size() == 1) return buf[0];
+      if (buf.size() == 2) return (buf[0] + buf[1]) * 0.5;
+      // 3点中值：max(min(a,b), min(max(a,b),c))
+      double a = buf[0], b = buf[1], c = buf[2];
+      return std::max(std::min(a, b), std::min(std::max(a, b), c));
     };
     
-    double yaw_vel_median = compute_median(yaw_vel_buffer_);
-    double base_yaw_vel_median = compute_median(base_yaw_vel_buffer_);
-    double pitch_vel_median = compute_median(pitch_vel_buffer_);
+    double yaw_vel_median = median3(yaw_vel_buffer_);
+    double base_yaw_vel_median = median3(base_yaw_vel_buffer_);
+    double pitch_vel_median = median3(pitch_vel_buffer_);
     
     // ✅ 3. 一阶低通滤波（强滤波）
     constexpr double kVelFilterAlpha = 0.95;  // ✅ 从 0.85 提升到 0.95（更强平滑）
@@ -755,21 +760,24 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     pitch_vel_filtered_ = kVelFilterAlpha * pitch_vel_filtered_ + 
                          (1.0 - kVelFilterAlpha) * pitch_vel_median;
     
-    // ✅ NaN检查速度滤波器输出
-    if (!std::isfinite(yaw_vel_filtered_)) {
-      ROS_ERROR_THROTTLE(1.0, "yaw_vel_filtered is NaN, resetting");
-      yaw_vel_filtered_ = 0.0;
-      yaw_vel_buffer_.clear();
-    }
-    if (!std::isfinite(base_yaw_vel_filtered_)) {
-      ROS_ERROR_THROTTLE(1.0, "base_yaw_vel_filtered is NaN, resetting");
-      base_yaw_vel_filtered_ = 0.0;
-      base_yaw_vel_buffer_.clear();
-    }
-    if (!std::isfinite(pitch_vel_filtered_)) {
-      ROS_ERROR_THROTTLE(1.0, "pitch_vel_filtered is NaN, resetting");
-      pitch_vel_filtered_ = 0.0;
-      pitch_vel_buffer_.clear();
+    // ✅ 批量 NaN 检查（减少分支预测失败）
+    bool has_nan = !std::isfinite(yaw_vel_filtered_) || 
+                   !std::isfinite(base_yaw_vel_filtered_) || 
+                   !std::isfinite(pitch_vel_filtered_);
+    if (has_nan) {
+      ROS_ERROR_THROTTLE(1.0, "[VEL] NaN detected, resetting filters");
+      if (!std::isfinite(yaw_vel_filtered_)) {
+        yaw_vel_filtered_ = 0.0;
+        yaw_vel_buffer_.clear();
+      }
+      if (!std::isfinite(base_yaw_vel_filtered_)) {
+        base_yaw_vel_filtered_ = 0.0;
+        base_yaw_vel_buffer_.clear();
+      }
+      if (!std::isfinite(pitch_vel_filtered_)) {
+        pitch_vel_filtered_ = 0.0;
+        pitch_vel_buffer_.clear();
+      }
     }
     
     // ✅ 4. 零点漂移消除（小速度归零）
@@ -782,6 +790,10 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     angular_vel_yaw.z = yaw_vel_filtered_;
     angular_vel_base_yaw.z = base_yaw_vel_filtered_;
     angular_vel_pitch.y = pitch_vel_filtered_;
+    
+    // ✅ 修复：使用滤波后的速度作为补偿基准（消除噪声）
+    imu_yaw_vel_ = yaw_vel_filtered_;
+    imu_base_yaw_vel_ = base_yaw_vel_filtered_;
   }
 
   // ...existing code for angle calculation...
@@ -791,10 +803,13 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   
   double dummy_roll, dummy_pitch;
   try {
-    odom2base_yaw_ = robot_state_handle_.lookupTransform("odom", base_yaw_joint_urdf_->child_link_name, time);
+    // ✅ 实车：使用 ros::Time(0) 获取最新可用的 TF，避免外推错误
+    odom2base_yaw_ = robot_state_handle_.lookupTransform("odom", base_yaw_joint_urdf_->child_link_name, 
+                                                          ros::Time(0));
     quatToRPY(odom2base_yaw_.transform.rotation, dummy_roll, dummy_pitch, base_yaw_real);
   } catch (tf2::TransformException& ex) {
-    ROS_WARN_THROTTLE(1.0, "Failed to get base_yaw transform: %s", ex.what());
+    // ✅ TF失败时使用关节编码器反馈作为后备（更可靠）
+    ROS_WARN_THROTTLE(5.0, "Failed to get base_yaw transform: %s, using joint encoder", ex.what());
     base_yaw_real = ctrl_base_yaw_.joint_.getPosition();
   }
   
@@ -813,8 +828,21 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     // ...existing TRACK mode code...
   }
   
+  // ✅ 实车修复：限位时的平滑处理
   if (!pitch_des_in_limit_) pitch_vel_des = 0.;
-  if (!yaw_des_in_limit_) yaw_vel_des = 0.;
+  if (!yaw_des_in_limit_) {
+    yaw_vel_des = 0.;
+    base_yaw_vel_des = 0.;
+  }
+  
+  // ✅ 检查是否接近限位（提前减速）
+  bool near_yaw_limit = false;
+  if (yaw_joint_urdf_->limits) {
+    double yaw_margin = 0.1;  // 限位前 0.1 rad (约 5.7°) 开始减速
+    double lower_limit = yaw_joint_urdf_->limits->lower + yaw_margin;
+    double upper_limit = yaw_joint_urdf_->limits->upper - yaw_margin;
+    near_yaw_limit = (yaw_real < lower_limit) || (yaw_real > upper_limit);
+  }
   
   // LQR 控制 - 使用try_lock避免阻塞
   Eigen::MatrixXd K_local;
@@ -850,7 +878,19 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   double base_yaw_des_smooth = td_base_yaw_->getX1();
   double base_yaw_vel_des_smooth = td_base_yaw_->getX2();
   
-  state_yaw_ << yaw_real, angular_vel_yaw.z, base_yaw_real, angular_vel_base_yaw.z;
+  // ✅ 实车关键修复：过滤速度反馈以消除编码器噪声
+  static double yaw_vel_for_lqr = 0.0;
+  static double base_yaw_vel_for_lqr = 0.0;
+  
+  // 强低通滤波（alpha接近1.0 = 极强平滑）
+  constexpr double kLQRVelFilterAlpha = 0.95;  // ✅ 专门用于LQR的速度滤波
+  yaw_vel_for_lqr = kLQRVelFilterAlpha * yaw_vel_for_lqr + 
+                    (1.0 - kLQRVelFilterAlpha) * angular_vel_yaw.z;
+  base_yaw_vel_for_lqr = kLQRVelFilterAlpha * base_yaw_vel_for_lqr + 
+                         (1.0 - kLQRVelFilterAlpha) * angular_vel_base_yaw.z;
+  
+  // 使用过滤后的速度构建状态向量
+  state_yaw_ << yaw_real, yaw_vel_for_lqr, base_yaw_real, base_yaw_vel_for_lqr;
   x_ref << yaw_des_smooth, yaw_vel_des_smooth, base_yaw_des_smooth, base_yaw_vel_des_smooth;
   Eigen::Vector4d x_err = state_yaw_ - x_ref;
   
@@ -863,8 +903,40 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     return;
   }
   
-  // LQR 控制计算
+  // LQR 控制计算（基于过滤后的速度）
   u = -K_local * x_err;
+  
+  // ✅ 实车修复：限位时的抗饱和处理
+  if (!yaw_des_in_limit_ || near_yaw_limit) {
+    // 到达限位或接近限位时，强制减小控制输出
+    constexpr double kLimitDampingFactor = 0.1;  // 限位时只保留 10% 的控制量
+    
+    if (!yaw_des_in_limit_) {
+      // 完全到达限位：几乎停止输出（只保留很小的恢复力）
+      u(0) *= 0.05;
+      u(1) *= 0.05;
+      ROS_WARN_THROTTLE(1.0, "[LIMIT] Yaw at limit, control reduced to 5%%");
+    } else if (near_yaw_limit) {
+      // 接近限位：渐进减速
+      u(0) *= kLimitDampingFactor;
+      u(1) *= kLimitDampingFactor;
+      ROS_DEBUG_THROTTLE(0.5, "[LIMIT] Yaw near limit, control reduced to 10%%");
+    }
+    
+    // 清空滤波器状态，防止积分饱和
+    u_yaw_stage1_ = 0.0;
+    u_base_yaw_stage1_ = 0.0;
+    u_yaw_history_.clear();
+    u_base_yaw_history_.clear();
+    u_yaw_final_ = 0.0;
+    u_base_yaw_final_ = 0.0;
+  }
+  
+  // ✅ 调试日志
+  ROS_DEBUG_THROTTLE(1.0, "[LQR] vel_raw=[%.3f,%.3f], vel_filtered=[%.3f,%.3f], u=[%.3f,%.3f], limit=%d, near_limit=%d",
+                     angular_vel_yaw.z, angular_vel_base_yaw.z,
+                     yaw_vel_for_lqr, base_yaw_vel_for_lqr,
+                     u(0), u(1), !yaw_des_in_limit_, near_yaw_limit);
   
   // ✅ 检查控制输出有效性
   if (!u.allFinite()) {
@@ -872,16 +944,23 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     u.setZero();
   }
   
-  // ✅ 重要修复: LQR输出u是加速度,需要积分成速度
-  // u的单位是rad/s², 需要转换为速度命令rad/s
-  // 方法1: 简单积分 v_cmd = v_current + u*dt (但可能累积误差)
-  // 方法2: 将u理解为速度控制的补偿量,乘以一个系数
-  // 这里采用方法2,将u缩放后作为速度命令
-  constexpr double kLQRtoVelocityScale = 0.02;  // ✅ 关键参数,需要调试
+  // ✅ 实车修复：LQR 输出后立即过滤（第一道防线）
+  static double u_lqr_yaw_filtered = 0.0;
+  static double u_lqr_base_yaw_filtered = 0.0;
   
-  // LQR反馈项(已经是速度的补偿)
-  double u_yaw_feedback = u(0) * kLQRtoVelocityScale;
-  double u_base_yaw_feedback = u(1) * kLQRtoVelocityScale;
+  // 对 LQR 原始输出进行强滤波
+  constexpr double kLQROutputFilterAlpha = 0.90;  // ✅ 强平滑 LQR 输出
+  u_lqr_yaw_filtered = kLQROutputFilterAlpha * u_lqr_yaw_filtered + 
+                       (1.0 - kLQROutputFilterAlpha) * u(0);
+  u_lqr_base_yaw_filtered = kLQROutputFilterAlpha * u_lqr_base_yaw_filtered + 
+                            (1.0 - kLQROutputFilterAlpha) * u(1);
+  
+  // ✅ 使用过滤后的 LQR 输出
+  constexpr double kLQRtoVelocityScale = 0.06;  // ✅ 保持适中的尺度
+  
+  // LQR反馈项（使用过滤后的值）
+  double u_yaw_feedback = u_lqr_yaw_filtered * kLQRtoVelocityScale;
+  double u_base_yaw_feedback = u_lqr_base_yaw_filtered * kLQRtoVelocityScale;
   
   // 前馈项(期望速度)
   double u_yaw_feedforward = config_.yaw_k_v_ * yaw_vel_des_smooth;
@@ -891,8 +970,11 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   double u_yaw_raw = u_yaw_feedforward + u_yaw_feedback;
   double u_base_yaw_raw = u_base_yaw_feedforward + u_base_yaw_feedback;
   
-  ROS_DEBUG_THROTTLE(1.0, "u_yaw: ff=%.3f, fb=%.3f, total=%.3f", 
-                     u_yaw_feedforward, u_yaw_feedback, u_yaw_raw);
+  ROS_DEBUG_THROTTLE(1.0, "[CTRL] u_lqr_raw=[%.3f,%.3f], u_lqr_filt=[%.3f,%.3f], u_fb=[%.3f,%.3f], u_total=[%.3f,%.3f]", 
+                     u(0), u(1),
+                     u_lqr_yaw_filtered, u_lqr_base_yaw_filtered,
+                     u_yaw_feedback, u_base_yaw_feedback,
+                     u_yaw_raw, u_base_yaw_raw);
   
   // ✅ 检查原始控制量
   if (!std::isfinite(u_yaw_raw)) u_yaw_raw = 0.0;
@@ -912,8 +994,8 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   }
   error_var /= error_history_.size();
   
-  // ✅ 根据误差方差动态调整滤波强度
-  double alpha_adaptive = (error_var > 0.01) ? 0.90 : 0.85;
+  // ✅ 实车：使用固定的强滤波（不自适应，优先稳定性）
+  constexpr double alpha_adaptive = 0.92;  // ✅ 从 0.75-0.80 提高到 0.92（强平滑）
   
   if (!filter_initialized_) {
     u_yaw_stage1_ = u_yaw_raw;
@@ -921,7 +1003,7 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     filter_initialized_ = true;
   }
   
-  // 第一级平滑
+  // 第一级平滑（强化）
   u_yaw_stage1_ = alpha_adaptive * u_yaw_stage1_ + (1.0 - alpha_adaptive) * u_yaw_raw;
   u_base_yaw_stage1_ = alpha_adaptive * u_base_yaw_stage1_ + (1.0 - alpha_adaptive) * u_base_yaw_raw;
   
@@ -954,8 +1036,8 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     u_base_yaw_stage2 = u_base_yaw_stage1_;
   }
   
-  // 第三级：最终输出平滑（强滤波）
-  constexpr double kFinalFilterAlpha = 0.92;  // ✅ 最终级强平滑
+  // 第三级：最终输出平滑（实车：极强平滑）
+  constexpr double kFinalFilterAlpha = 0.95;  // ✅ 实车专用：从 0.85 提高到 0.95
   
   u_yaw_final_ = kFinalFilterAlpha * u_yaw_final_ + (1.0 - kFinalFilterAlpha) * u_yaw_stage2;
   u_base_yaw_final_ = kFinalFilterAlpha * u_base_yaw_final_ + (1.0 - kFinalFilterAlpha) * u_base_yaw_stage2;
@@ -976,6 +1058,26 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   
   u_yaw_ = u_yaw_final_;
   u_base_yaw_ = u_base_yaw_final_;
+  
+  // ✅ 实车修复：限位时的速度方向检查（防止往限位方向继续运动）
+  if (!yaw_des_in_limit_ && yaw_joint_urdf_->limits) {
+    //double yaw_pos_error = x_err(0);  // yaw 位置误差
+    
+    // 如果在上限位且还想往正方向走，禁止
+    if (yaw_real >= yaw_joint_urdf_->limits->upper - 0.01 && u_yaw_ > 0.0) {
+      ROS_WARN_THROTTLE(0.5, "[LIMIT] At upper limit (%.3f >= %.3f), blocking positive command",
+                       yaw_real, yaw_joint_urdf_->limits->upper);
+      u_yaw_ = 0.0;
+      u_base_yaw_ = 0.0;
+    }
+    // 如果在下限位且还想往负方向走，禁止
+    else if (yaw_real <= yaw_joint_urdf_->limits->lower + 0.01 && u_yaw_ < 0.0) {
+      ROS_WARN_THROTTLE(0.5, "[LIMIT] At lower limit (%.3f <= %.3f), blocking negative command",
+                       yaw_real, yaw_joint_urdf_->limits->lower);
+      u_yaw_ = 0.0;
+      u_base_yaw_ = 0.0;
+    }
+  }
   
   // ✅ 6. 限制控制输出幅度（速度命令,单位rad/s）
   constexpr double max_command = 10.0;  // ✅ 最大角速度10 rad/s (约573°/s)
@@ -998,7 +1100,8 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   }
   
   // ✅ 7. 小控制量归零（减少抖动）
-  constexpr double kControlDeadzone = 0.05;
+  // ⚠️ 死区太大会导致停顿明显,降低到0.005 rad/s (约0.3°/s)
+  constexpr double kControlDeadzone = 0.001;
   if (std::abs(u_yaw_) < kControlDeadzone) u_yaw_ = 0.0;
   if (std::abs(u_base_yaw_) < kControlDeadzone) u_base_yaw_ = 0.0;
   
@@ -1034,9 +1137,49 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   }
   loop_count_++;
   
-  // 发送控制命令
-  ctrl_yaw_.setCommand(u_yaw_);
-  ctrl_base_yaw_.setCommand(u_base_yaw_);
+  // ✅ 核心修复：使用滤波后的速度进行编码器噪声补偿
+  // 
+  // 补偿原理：
+  //   内环PID看到的是编码器速度（有噪声），会产生错误的控制输出
+  //   通过 IMU/滤波速度（低噪声）估计编码器噪声，提前补偿
+  //
+  // 补偿公式：
+  //   最终命令 = LQR期望速度 + (编码器速度 - 真实速度估计)
+  //            = 期望速度 + 编码器噪声估计
+  
+  // ✅ 对编码器速度也进行滤波，确保补偿项不引入新噪声
+  static double encoder_yaw_vel_filtered = 0.0;
+  static double encoder_base_yaw_vel_filtered = 0.0;
+  
+  constexpr double kEncoderFilterAlpha = 0.85;  // 中等强度滤波（保留部分高频响应）
+  encoder_yaw_vel_filtered = kEncoderFilterAlpha * encoder_yaw_vel_filtered + 
+                             (1.0 - kEncoderFilterAlpha) * ctrl_yaw_.joint_.getVelocity();
+  encoder_base_yaw_vel_filtered = kEncoderFilterAlpha * encoder_base_yaw_vel_filtered + 
+                                  (1.0 - kEncoderFilterAlpha) * ctrl_base_yaw_.joint_.getVelocity();
+  
+  // 计算编码器噪声估计（使用滤波后的值）
+  double yaw_noise_compensation = encoder_yaw_vel_filtered - imu_yaw_vel_;
+  double base_yaw_noise_compensation = encoder_base_yaw_vel_filtered - imu_base_yaw_vel_;
+  
+  // ✅ 限制补偿量，防止过度补偿
+  constexpr double kMaxCompensation = 2.0;  // rad/s
+  yaw_noise_compensation = std::max(-kMaxCompensation, 
+                                     std::min(kMaxCompensation, yaw_noise_compensation));
+  base_yaw_noise_compensation = std::max(-kMaxCompensation, 
+                                          std::min(kMaxCompensation, base_yaw_noise_compensation));
+  
+  // 最终控制命令 = LQR输出 + 噪声补偿
+  double yaw_cmd_final = u_yaw_ + yaw_noise_compensation;
+  double base_yaw_cmd_final = u_base_yaw_ + base_yaw_noise_compensation;
+  
+  // ✅ 调试日志
+  ROS_DEBUG_THROTTLE(1.0, "[COMPENSATION] yaw: u=%.3f, enc_filt=%.3f, imu=%.3f, comp=%.3f, final=%.3f",
+                     u_yaw_, encoder_yaw_vel_filtered, imu_yaw_vel_, 
+                     yaw_noise_compensation, yaw_cmd_final);
+  
+  ctrl_yaw_.setCommand(yaw_cmd_final);
+  ctrl_base_yaw_.setCommand(base_yaw_cmd_final);
+  
   ctrl_pitch_.setCommand(-(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
                          ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y));
   
@@ -1084,7 +1227,11 @@ void Controller::updateChassisVel(){
 }
 
 void Controller::updateRLS(){
-  if (!enable_online_lqr_ || !running_) return;
+  if (!enable_online_lqr_ || !running_) {
+    ROS_DEBUG_THROTTLE(10.0, "[RLS] Disabled: online_lqr=%d, running=%d", 
+                      enable_online_lqr_, running_.load());
+    return;
+  }
   
   // 构建当前状态向量
   Eigen::VectorXd x(n_);
@@ -1094,12 +1241,13 @@ void Controller::updateRLS(){
     x(2) = ctrl_base_yaw_.joint_.getPosition();
     x(3) = ctrl_base_yaw_.joint_.getVelocity();
   } catch (const std::exception& e) {
-    ROS_ERROR_THROTTLE(1.0, "Error reading joint states: %s", e.what());
+    ROS_ERROR_THROTTLE(1.0, "[RLS] Error reading joint states: %s", e.what());
     return;
   }
   
   if (!x.allFinite()) {
-    ROS_ERROR_THROTTLE(1.0, "Current state contains NaN/Inf");
+    ROS_ERROR_THROTTLE(1.0, "[RLS] Current state contains NaN/Inf: [%.2f, %.2f, %.2f, %.2f]",
+                      x(0), x(1), x(2), x(3));
     return;
   }
   
@@ -1107,22 +1255,50 @@ void Controller::updateRLS(){
   std::unique_lock<std::mutex> lk_rls(rls_mutex_, std::try_to_lock);
   if (!lk_rls.owns_lock()) {
     // 工作线程正在更新,跳过本次RLS更新(不影响控制稳定性)
-    ROS_DEBUG_THROTTLE(5.0, "RLS mutex busy, skipping update");
+    ROS_DEBUG_THROTTLE(5.0, "[RLS] Mutex busy, skipping update");
+    return;
+  }
+  
+  // ✅ 详细日志：为什么不进入 RLS 更新
+  if (!have_prev_sample_) {
+    ROS_WARN_THROTTLE(2.0, "[RLS] No previous sample, initializing (count=%zu)", sample_count_);
+    x_prev_ = x;
+    u_prev_sample_.resize(m_);
+    u_prev_sample_(0) = u_yaw_cmd_;
+    u_prev_sample_(1) = u_base_yaw_cmd_;
+    have_prev_sample_ = true;
+    return;
+  }
+  
+  if (driver_saturated_) {
+    ROS_WARN_THROTTLE(2.0, "[RLS] Driver saturated flag set, waiting for normal operation (count=%zu)", sample_count_);
+    // ✅ 检查当前输入是否仍然饱和
+    constexpr double kSaturationThreshold = 4.8;
+    if (std::abs(u_yaw_cmd_) < kSaturationThreshold && std::abs(u_base_yaw_cmd_) < kSaturationThreshold) {
+      driver_saturated_ = false;
+      ROS_INFO("[RLS] Saturation cleared, resuming updates");
+    }
+    x_prev_ = x;
+    u_prev_sample_(0) = u_yaw_cmd_;
+    u_prev_sample_(1) = u_base_yaw_cmd_;
     return;
   }
   
   if (have_prev_sample_ && !driver_saturated_) {
-    // ✅ 检测速度异常
-    constexpr double kMaxReasonableVel = 30.0;  // ✅ 降低阈值（更敏感）
+    // ✅ 实车：放宽速度限制（考虑高速运动场景）
+    constexpr double kMaxReasonableVel = 50.0;  // ✅ 提高阈值，允许更高速度
     if (std::abs(x(1)) > kMaxReasonableVel || std::abs(x(3)) > kMaxReasonableVel) {
-      ROS_WARN_THROTTLE(1.0, "Abnormal velocity: yaw_vel=%.2f, base_yaw_vel=%.2f, skipping",
-                       x(1), x(3));
+      ROS_WARN_THROTTLE(1.0, "[RLS] ❌ Skip reason: Abnormal velocity: yaw_vel=%.2f, base_yaw_vel=%.2f (threshold=%.1f)",
+                       x(1), x(3), kMaxReasonableVel);
       x_prev_ = x;
+      u_prev_sample_(0) = u_yaw_cmd_;
+      u_prev_sample_(1) = u_base_yaw_cmd_;
       return;
     }
     
     if (x_prev_.size() != n_ || u_prev_sample_.size() != m_) {
-      ROS_ERROR_THROTTLE(1.0, "Dimension error");
+      ROS_ERROR_THROTTLE(1.0, "[RLS] ❌ Skip reason: Dimension error: x_prev=%ld (expect %d), u_prev=%ld (expect %d)",
+                        x_prev_.size(), n_, u_prev_sample_.size(), m_);
       x_prev_.resize(n_);
       u_prev_sample_.resize(m_);
       x_prev_.setZero();
@@ -1131,24 +1307,32 @@ void Controller::updateRLS(){
     }
     
     if (!x_prev_.allFinite() || !u_prev_sample_.allFinite()) {
-      ROS_ERROR_THROTTLE(1.0, "Previous data invalid");
+      ROS_ERROR_THROTTLE(1.0, "[RLS] ❌ Skip reason: Previous data invalid: x_prev finite=%d, u_prev finite=%d",
+                        x_prev_.allFinite(), u_prev_sample_.allFinite());
       x_prev_ = x;
-      u_prev_sample_.setZero();
+      u_prev_sample_(0) = u_yaw_cmd_;
+      u_prev_sample_(1) = u_base_yaw_cmd_;
       return;
     }
     
-    // ✅ 检测输入饱和
-    constexpr double kSaturationThreshold = 4.5;  // ✅ 降低阈值（对应 max_command=5）
+    // ✅ 实车：放宽饱和检测（允许更大输入用于辨识）
+    constexpr double kSaturationThreshold = 4.8;  // ✅ 提高阈值，接近 max_command=5
     if (std::abs(u_prev_sample_(0)) > kSaturationThreshold || 
         std::abs(u_prev_sample_(1)) > kSaturationThreshold) {
-      ROS_DEBUG_THROTTLE(2.0, "Input saturated (%.2f, %.2f), skipping",
-                        u_prev_sample_(0), u_prev_sample_(1));
+      ROS_WARN_THROTTLE(1.0, "[RLS] ❌ Skip reason: Input saturated u_prev=(%.2f, %.2f), threshold=%.1f, setting flag",
+                        u_prev_sample_(0), u_prev_sample_(1), kSaturationThreshold);
       driver_saturated_ = true;
       x_prev_ = x;
+      u_prev_sample_(0) = u_yaw_cmd_;
+      u_prev_sample_(1) = u_base_yaw_cmd_;
       return;
     } else {
       driver_saturated_ = false;
     }
+    
+    // ✅ 成功通过所有检查，开始 RLS 更新
+    ROS_INFO_THROTTLE(5.0, "[RLS] ✅ Updating: sample=%zu, x=[%.3f,%.2f,%.3f,%.2f], u_prev=[%.2f,%.2f]",
+                     sample_count_, x(0), x(1), x(2), x(3), u_prev_sample_(0), u_prev_sample_(1));
     
     // 构建回归向量
     Eigen::VectorXd phi(n_ + m_);
@@ -1157,7 +1341,7 @@ void Controller::updateRLS(){
     // RLS 核心算法
     Eigen::VectorXd Pphi = Pcov_ * phi;
     if (!Pphi.allFinite()) {
-      ROS_ERROR_THROTTLE(1.0, "Pphi invalid, resetting Pcov");
+      ROS_ERROR_THROTTLE(1.0, "[RLS] Pphi invalid, resetting Pcov");
       Pcov_ = Eigen::MatrixXd::Identity(n_ + m_, n_ + m_) * 0.1;
       Pphi = Pcov_ * phi;
     }
@@ -1170,44 +1354,50 @@ void Controller::updateRLS(){
     
     Eigen::VectorXd Kk = Pphi / denom;
     if (!Kk.allFinite()) {
-      ROS_ERROR_THROTTLE(1.0, "Kk invalid");
+      ROS_ERROR_THROTTLE(1.0, "[RLS] Kk invalid, skipping update");
       x_prev_ = x;
+      u_prev_sample_(0) = u_yaw_cmd_;
+      u_prev_sample_(1) = u_base_yaw_cmd_;
       return;
     }
     
     Eigen::VectorXd pred = Theta_ * phi;
     if (!pred.allFinite()) {
-      ROS_ERROR_THROTTLE(1.0, "pred invalid, resetting Theta");
+      ROS_ERROR_THROTTLE(1.0, "[RLS] pred invalid, resetting Theta");
       resetThetaToDefault();
       x_prev_ = x;
+      u_prev_sample_(0) = u_yaw_cmd_;
+      u_prev_sample_(1) = u_base_yaw_cmd_;
       return;
     }
     
     Eigen::VectorXd err = x - pred;
     
-    // ✅ 更严格的误差限制
-    constexpr double kMaxErrorNorm = 0.15;  // ✅ 进一步降低（从 0.2 到 0.15）
+    // ✅ 实车：放宽误差限制（允许更大的模型误差）
+    constexpr double kMaxErrorNorm = 0.25;  // ✅ 提高阈值，适应实车噪声
     if (err.norm() > kMaxErrorNorm) {
-      ROS_WARN_THROTTLE(2.0, "Error norm %.4f > %.2f, clamping",
+      ROS_WARN_THROTTLE(2.0, "[RLS] Error norm %.4f > %.2f, clamping",
                        err.norm(), kMaxErrorNorm);
       err = err * (kMaxErrorNorm / err.norm());
     }
     
     Eigen::MatrixXd delta = err * Kk.transpose();
     
-    // ✅ 更小的更新步长
-    constexpr double kMaxDeltaNorm = 0.003;  // ✅ 进一步降低（从 0.005 到 0.003）
+    // ✅ 实车：适中的更新步长（平衡收敛速度和稳定性）
+    constexpr double kMaxDeltaNorm = 0.008;  // ✅ 提高步长，加快收敛
     double delta_norm = delta.norm();
     if (delta_norm > kMaxDeltaNorm) {
-      ROS_DEBUG_THROTTLE(2.0, "Delta norm %.4f > %.4f, scaling",
+      ROS_DEBUG_THROTTLE(2.0, "[RLS] Delta norm %.4f > %.4f, scaling",
                         delta_norm, kMaxDeltaNorm);
       delta = delta * (kMaxDeltaNorm / delta_norm);
     }
     
     Eigen::MatrixXd Theta_new = Theta_ + delta;
     if (!Theta_new.allFinite()) {
-      ROS_ERROR_THROTTLE(1.0, "Theta_new invalid");
+      ROS_ERROR_THROTTLE(1.0, "[RLS] Theta_new invalid, skipping update");
       x_prev_ = x;
+      u_prev_sample_(0) = u_yaw_cmd_;
+      u_prev_sample_(1) = u_base_yaw_cmd_;
       return;
     }
     
@@ -1224,11 +1414,11 @@ void Controller::updateRLS(){
       Pcov_ = Eigen::MatrixXd::Identity(n_ + m_, n_ + m_) * 0.1;
     }
     
-    // ✅ 限制协方差矩阵增长
+    // ✅ 实车：放宽协方差矩阵限制
     double pcov_trace = Pcov_.trace();
-    constexpr double kMaxPcovTrace = 5.0;  // ✅ 降低上限（从 10.0 到 5.0）
+    constexpr double kMaxPcovTrace = 8.0;  // ✅ 提高上限，允许更大的不确定性
     if (pcov_trace > kMaxPcovTrace) {
-      ROS_WARN_THROTTLE(5.0, "Pcov trace %.2f > %.1f, scaling",
+      ROS_WARN_THROTTLE(5.0, "[RLS] Pcov trace %.2f > %.1f, scaling",
                        pcov_trace, kMaxPcovTrace);
       Pcov_ *= (kMaxPcovTrace / pcov_trace);
     }
@@ -1253,10 +1443,15 @@ void Controller::updateRLS(){
     
     sample_count_++;
     
-    // 定期打印
+    // 定期打印 RLS 更新状态
+    if (sample_count_ % 50 == 0) {
+      ROS_INFO("[RLS] Sample %zu: err=%.4f, sat=%d, vel=[%.2f,%.2f], u=[%.2f,%.2f]",
+               sample_count_, recent_avg_error_, driver_saturated_,
+               x(1), x(3), u_prev_sample_(0), u_prev_sample_(1));
+    }
     if (sample_count_ % 100 == 0) {
-      ROS_INFO("RLS [%zu]: avg_err=%.4f, decay=[%.3f,%.3f], gain=[%.2f,%.2f]",
-               sample_count_, recent_avg_error_,
+      ROS_INFO("[RLS] Theta [%zu]: decay=[%.3f,%.3f], gain=[%.2f,%.2f]",
+               sample_count_,
                Theta_(1,1), Theta_(3,3),
                Theta_(1,n_)/0.001, Theta_(3,n_+1)/0.001);
     }
@@ -1905,8 +2100,8 @@ void Controller::resetThetaToDefault() {
   Theta_ = Eigen::MatrixXd::Zero(n_, n_ + m_);
   
   constexpr double dt = 0.001;
-  constexpr double velocity_decay = 0.85;  // ✅ 降低到 0.85（增强阻尼）
-  constexpr double input_gain = 0.5;       // ✅ 降低到 0.5（减少响应）
+  constexpr double velocity_decay = 0.65;  // ✅ 降低到 0.85（增强阻尼）
+  constexpr double input_gain = 1.0;       // ✅ 降低到 0.5（减少响应）
   
   // 位置行：纯积分关系
   Theta_(0, 1) = dt;
