@@ -271,6 +271,8 @@ td_base_yaw_ = std::make_unique<NonlinearTrackingDifferentiator<double>>(r_base_
     K_current_ = K_yaw_;
     K_old_ = K_yaw_;
     K_target_ = K_yaw_;
+    K_safe_read_ = K_yaw_;  // ✅ 初始化读取缓存
+    K_ready_ = true;         // ✅ 标记已就绪
     last_successful_K_ = K_yaw_;
     
     // 11. 初始化RLS
@@ -327,31 +329,104 @@ void Controller::starting(const ros::Time& /*unused*/){
   state_ = RATE;
   state_changed_ = true;
   start_ = true;
-    if (enable_online_lqr_ && !running_) {
+  
+  // ✅ 初始化所有滤波器状态变量（防止Gazebo崩溃）
+  last_yaw_vel_ = 0.0;
+  last_base_yaw_vel_ = 0.0;
+  last_pitch_vel_ = 0.0;
+  yaw_vel_buffer_.clear();
+  base_yaw_vel_buffer_.clear();
+  pitch_vel_buffer_.clear();
+  
+  error_history_.clear();
+  error_history_.resize(10, 0.0);
+  u_yaw_stage1_ = 0.0;
+  u_base_yaw_stage1_ = 0.0;
+  filter_initialized_ = false;
+  u_yaw_history_.clear();
+  u_base_yaw_history_.clear();
+  u_yaw_final_ = 0.0;
+  u_base_yaw_final_ = 0.0;
+  
+  error_samples_.clear();
+  
+  // ✅ 初始化K矩阵读取缓存
+  {
+    std::lock_guard<std::mutex> lk(K_mutex_);
+    K_safe_read_ = K_current_;
+    K_ready_ = true;
+  }
+  
+  ROS_INFO("Filter states initialized");
+  
+  ROS_INFO("[Gimbal] enable_online_lqr_=%d, running_=%d", enable_online_lqr_, running_.load());
+  
+  if (enable_online_lqr_ && !running_) {
     running_ = true;
     worker_thread_ = std::thread(&Controller::onlineLQRUpdate, this);
-    ROS_INFO("Adaptive LQR worker thread started");
+    ROS_INFO("[Gimbal] Adaptive LQR worker thread started (thread id: %lu)", 
+             std::hash<std::thread::id>{}(worker_thread_.get_id()));
+  } else {
+    if (!enable_online_lqr_) {
+      ROS_WARN("[Gimbal] Online LQR is DISABLED in config!");
+    }
+    if (running_) {
+      ROS_WARN("[Gimbal] Worker thread already running!");
+    }
   }
 }
 
 void Controller::stopping(const ros::Time& /*time*/){
   ROS_INFO("[Gimbal] Stopping controller...");
   
-  // 1. 先停止工作线程
+  // 1. 先停止在线LQR(防止主循环继续调用updateRLS)
+  enable_online_lqr_ = false;
+  
+  // 2. 停止工作线程循环
   running_ = false;
   
-  // 2. 等待线程安全退出
+  // 3. 清零所有控制输出(确保电机安全)
+  try {
+    ctrl_yaw_.setCommand(0.0);
+    ctrl_base_yaw_.setCommand(0.0);
+    ctrl_pitch_.setCommand(0.0);
+  } catch (...) {
+    ROS_ERROR("[Gimbal] Exception while clearing commands");
+  }
+  
+  // 4. 等待工作线程退出
   if (worker_thread_.joinable())
   {
     ROS_INFO("[Gimbal] Waiting for worker thread to stop...");
-    worker_thread_.join();
-    ROS_INFO("[Gimbal] Worker thread stopped successfully");
+    
+    // 给工作线程300ms时间自然退出
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    
+    // 检查是否还需要join
+    if (worker_thread_.joinable()) {
+      // 使用future实现带超时的join
+      std::packaged_task<void()> task([this]() {
+        if (worker_thread_.joinable()) {
+          worker_thread_.join();
+        }
+      });
+      
+      auto future = task.get_future();
+      std::thread(std::move(task)).detach();
+      
+      // 等待最多1秒
+      if (future.wait_for(std::chrono::seconds(1)) == std::future_status::timeout) {
+        ROS_WARN("[Gimbal] Worker thread timeout, forcing detach");
+        if (worker_thread_.joinable()) {
+          worker_thread_.detach();
+        }
+      } else {
+        ROS_INFO("[Gimbal] Worker thread stopped successfully");
+      }
+    } else {
+      ROS_INFO("[Gimbal] Worker thread already stopped");
+    }
   }
-  
-  // 3. 清零所有控制输出
-  ctrl_yaw_.setCommand(0.0);
-  ctrl_base_yaw_.setCommand(0.0);
-  ctrl_pitch_.setCommand(0.0);
   
   ROS_INFO("[Gimbal] Controller stopped");
 }
@@ -628,49 +703,47 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
     
     // ✅ 1. 异常值检测（防止编码器跳变）
     constexpr double kMaxVelChange = 100.0;  // rad/s²
-    static double last_yaw_vel = 0.0, last_base_yaw_vel = 0.0, last_pitch_vel = 0.0;
     
-    if (std::abs(yaw_vel_raw - last_yaw_vel) > kMaxVelChange * 0.001) {
+    if (std::abs(yaw_vel_raw - last_yaw_vel_) > kMaxVelChange * 0.001) {
       ROS_WARN_THROTTLE(0.5, "Yaw vel spike detected: %.2f → %.2f, rejecting",
-                       last_yaw_vel, yaw_vel_raw);
-      yaw_vel_raw = last_yaw_vel;
+                       last_yaw_vel_, yaw_vel_raw);
+      yaw_vel_raw = last_yaw_vel_;
     }
-    if (std::abs(base_yaw_vel_raw - last_base_yaw_vel) > kMaxVelChange * 0.001) {
+    if (std::abs(base_yaw_vel_raw - last_base_yaw_vel_) > kMaxVelChange * 0.001) {
       ROS_WARN_THROTTLE(0.5, "Base yaw vel spike detected, rejecting");
-      base_yaw_vel_raw = last_base_yaw_vel;
+      base_yaw_vel_raw = last_base_yaw_vel_;
     }
-    if (std::abs(pitch_vel_raw - last_pitch_vel) > kMaxVelChange * 0.001) {
+    if (std::abs(pitch_vel_raw - last_pitch_vel_) > kMaxVelChange * 0.001) {
       ROS_WARN_THROTTLE(0.5, "Pitch vel spike detected, rejecting");
-      pitch_vel_raw = last_pitch_vel;
+      pitch_vel_raw = last_pitch_vel_;
     }
     
-    last_yaw_vel = yaw_vel_raw;
-    last_base_yaw_vel = base_yaw_vel_raw;
-    last_pitch_vel = pitch_vel_raw;
+    last_yaw_vel_ = yaw_vel_raw;
+    last_base_yaw_vel_ = base_yaw_vel_raw;
+    last_pitch_vel_ = pitch_vel_raw;
     
     // ✅ 2. 中值滤波（移动窗口大小为5）
     constexpr size_t kMedianFilterSize = 5;
-    static std::deque<double> yaw_vel_buffer, base_yaw_vel_buffer, pitch_vel_buffer;
     
-    yaw_vel_buffer.push_back(yaw_vel_raw);
-    base_yaw_vel_buffer.push_back(base_yaw_vel_raw);
-    pitch_vel_buffer.push_back(pitch_vel_raw);
+    yaw_vel_buffer_.push_back(yaw_vel_raw);
+    base_yaw_vel_buffer_.push_back(base_yaw_vel_raw);
+    pitch_vel_buffer_.push_back(pitch_vel_raw);
     
-    if (yaw_vel_buffer.size() > kMedianFilterSize) yaw_vel_buffer.pop_front();
-    if (base_yaw_vel_buffer.size() > kMedianFilterSize) base_yaw_vel_buffer.pop_front();
-    if (pitch_vel_buffer.size() > kMedianFilterSize) pitch_vel_buffer.pop_front();
+    if (yaw_vel_buffer_.size() > kMedianFilterSize) yaw_vel_buffer_.pop_front();
+    if (base_yaw_vel_buffer_.size() > kMedianFilterSize) base_yaw_vel_buffer_.pop_front();
+    if (pitch_vel_buffer_.size() > kMedianFilterSize) pitch_vel_buffer_.pop_front();
     
-    // 计算中值
-    auto compute_median = [](std::deque<double> buf) -> double {
+    // 计算中值 - 添加安全检查防止崩溃
+    auto compute_median = [](const std::deque<double>& buf) -> double {
       if (buf.empty()) return 0.0;
       std::vector<double> sorted(buf.begin(), buf.end());
       std::sort(sorted.begin(), sorted.end());
       return sorted[sorted.size() / 2];
     };
     
-    double yaw_vel_median = compute_median(yaw_vel_buffer);
-    double base_yaw_vel_median = compute_median(base_yaw_vel_buffer);
-    double pitch_vel_median = compute_median(pitch_vel_buffer);
+    double yaw_vel_median = compute_median(yaw_vel_buffer_);
+    double base_yaw_vel_median = compute_median(base_yaw_vel_buffer_);
+    double pitch_vel_median = compute_median(pitch_vel_buffer_);
     
     // ✅ 3. 一阶低通滤波（强滤波）
     constexpr double kVelFilterAlpha = 0.95;  // ✅ 从 0.85 提升到 0.95（更强平滑）
@@ -681,6 +754,23 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
                             (1.0 - kVelFilterAlpha) * base_yaw_vel_median;
     pitch_vel_filtered_ = kVelFilterAlpha * pitch_vel_filtered_ + 
                          (1.0 - kVelFilterAlpha) * pitch_vel_median;
+    
+    // ✅ NaN检查速度滤波器输出
+    if (!std::isfinite(yaw_vel_filtered_)) {
+      ROS_ERROR_THROTTLE(1.0, "yaw_vel_filtered is NaN, resetting");
+      yaw_vel_filtered_ = 0.0;
+      yaw_vel_buffer_.clear();
+    }
+    if (!std::isfinite(base_yaw_vel_filtered_)) {
+      ROS_ERROR_THROTTLE(1.0, "base_yaw_vel_filtered is NaN, resetting");
+      base_yaw_vel_filtered_ = 0.0;
+      base_yaw_vel_buffer_.clear();
+    }
+    if (!std::isfinite(pitch_vel_filtered_)) {
+      ROS_ERROR_THROTTLE(1.0, "pitch_vel_filtered is NaN, resetting");
+      pitch_vel_filtered_ = 0.0;
+      pitch_vel_buffer_.clear();
+    }
     
     // ✅ 4. 零点漂移消除（小速度归零）
     constexpr double kVelDeadzone = 0.05;  // rad/s
@@ -726,21 +816,31 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   if (!pitch_des_in_limit_) pitch_vel_des = 0.;
   if (!yaw_des_in_limit_) yaw_vel_des = 0.;
   
-  // LQR 控制
+  // LQR 控制 - 使用try_lock避免阻塞
   Eigen::MatrixXd K_local;
   {
-    std::lock_guard<std::mutex> lk(K_mutex_);
-    if (switching_) {
-      double t = (ros::Time::now() - switch_start_time_).toSec();
-      double alpha = std::min(1.0, t / switch_smooth_T_);
-      K_current_ = (1.0 - alpha) * K_old_ + alpha * K_target_;
-      if (alpha >= 1.0) {
-        switching_ = false;
-        K_old_ = K_target_;
-        u_max_ = u_max_normal_;
+    std::unique_lock<std::mutex> lk(K_mutex_, std::try_to_lock);
+    if (lk.owns_lock()) {
+      // 成功获取锁
+      if (switching_) {
+        double t = (ros::Time::now() - switch_start_time_).toSec();
+        double alpha = std::min(1.0, t / switch_smooth_T_);
+        K_current_ = (1.0 - alpha) * K_old_ + alpha * K_target_;
+        if (alpha >= 1.0) {
+          switching_ = false;
+          K_old_ = K_target_;
+          u_max_ = u_max_normal_;
+        }
       }
+      K_local = K_current_;
+      K_safe_read_ = K_current_;  // 更新缓存
+    } else {
+      // 锁被占用(工作线程正在更新),使用缓存值
+      // 注意:这里必须上锁读取缓存,避免数据竞争
+      lk.lock();  // 等待锁(< 1ms)
+      K_local = K_safe_read_;
+      ROS_DEBUG_THROTTLE(5.0, "K_mutex busy, using cached K");
     }
-    K_local = K_current_;
   }
   
   td_yaw_->update(yaw_des, yaw_vel_des);
@@ -754,74 +854,146 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period){
   x_ref << yaw_des_smooth, yaw_vel_des_smooth, base_yaw_des_smooth, base_yaw_vel_des_smooth;
   Eigen::Vector4d x_err = state_yaw_ - x_ref;
   
+  // ✅ 检查状态向量有效性
+  if (!state_yaw_.allFinite() || !x_ref.allFinite()) {
+    ROS_ERROR_THROTTLE(1.0, "State or reference contains NaN/Inf, skipping control");
+    ctrl_yaw_.setCommand(0.0);
+    ctrl_base_yaw_.setCommand(0.0);
+    ctrl_pitch_.setCommand(0.0);
+    return;
+  }
+  
   // LQR 控制计算
   u = -K_local * x_err;
   
-  double u_yaw_raw = u(0) + config_.yaw_k_v_ * yaw_vel_des_smooth;
-  double u_base_yaw_raw = u(1) + config_.yaw_k_v_ * base_yaw_vel_des_smooth;
+  // ✅ 检查控制输出有效性
+  if (!u.allFinite()) {
+    ROS_ERROR_THROTTLE(1.0, "LQR output contains NaN/Inf, using zero control");
+    u.setZero();
+  }
+  
+  // ✅ 重要修复: LQR输出u是加速度,需要积分成速度
+  // u的单位是rad/s², 需要转换为速度命令rad/s
+  // 方法1: 简单积分 v_cmd = v_current + u*dt (但可能累积误差)
+  // 方法2: 将u理解为速度控制的补偿量,乘以一个系数
+  // 这里采用方法2,将u缩放后作为速度命令
+  constexpr double kLQRtoVelocityScale = 0.02 ;  // ✅ 关键参数,需要调试
+  
+  // LQR反馈项(已经是速度的补偿)
+  double u_yaw_feedback = u(0) * kLQRtoVelocityScale;
+  double u_base_yaw_feedback = u(1) * kLQRtoVelocityScale;
+  
+  // 前馈项(期望速度)
+  double u_yaw_feedforward = config_.yaw_k_v_ * yaw_vel_des_smooth;
+  double u_base_yaw_feedforward = config_.yaw_k_v_ * base_yaw_vel_des_smooth;
+  
+  // 最终速度命令 = 前馈 + 反馈
+  double u_yaw_raw = u_yaw_feedforward + u_yaw_feedback;
+  double u_base_yaw_raw = u_base_yaw_feedforward + u_base_yaw_feedback;
+  
+  ROS_DEBUG_THROTTLE(1.0, "u_yaw: ff=%.3f, fb=%.3f, total=%.3f", 
+                     u_yaw_feedforward, u_yaw_feedback, u_yaw_raw);
+  
+  // ✅ 检查原始控制量
+  if (!std::isfinite(u_yaw_raw)) u_yaw_raw = 0.0;
+  if (!std::isfinite(u_base_yaw_raw)) u_base_yaw_raw = 0.0;
   
   // ✅ 5. 三级平滑滤波（彻底消除毛刺）
   // 第一级：状态依赖的自适应滤波
-  static std::deque<double> error_history(10, 0.0);
-  error_history.pop_front();
-  error_history.push_back(x_err.norm());
+  if (error_history_.size() < 10) {
+    error_history_.resize(10, 0.0);  // 首次调用时初始化
+  }
+  error_history_.pop_front();
+  error_history_.push_back(x_err.norm());
   
   double error_var = 0;
-  for(const auto& err : error_history) {
-    error_var += std::pow(err - error_history.back(), 2);
+  for(const auto& err : error_history_) {
+    error_var += std::pow(err - error_history_.back(), 2);
   }
-  error_var /= error_history.size();
+  error_var /= error_history_.size();
   
   // ✅ 根据误差方差动态调整滤波强度
   double alpha_adaptive = (error_var > 0.01) ? 0.90 : 0.85;
   
-  static double u_yaw_stage1 = 0.0, u_base_yaw_stage1 = 0.0;
-  static bool first_call = true;
-  if (first_call) {
-    u_yaw_stage1 = u_yaw_raw;
-    u_base_yaw_stage1 = u_base_yaw_raw;
-    first_call = false;
+  if (!filter_initialized_) {
+    u_yaw_stage1_ = u_yaw_raw;
+    u_base_yaw_stage1_ = u_base_yaw_raw;
+    filter_initialized_ = true;
   }
   
   // 第一级平滑
-  u_yaw_stage1 = alpha_adaptive * u_yaw_stage1 + (1.0 - alpha_adaptive) * u_yaw_raw;
-  u_base_yaw_stage1 = alpha_adaptive * u_base_yaw_stage1 + (1.0 - alpha_adaptive) * u_base_yaw_raw;
+  u_yaw_stage1_ = alpha_adaptive * u_yaw_stage1_ + (1.0 - alpha_adaptive) * u_yaw_raw;
+  u_base_yaw_stage1_ = alpha_adaptive * u_base_yaw_stage1_ + (1.0 - alpha_adaptive) * u_base_yaw_raw;
+  
+  // ✅ 阻断NaN传播
+  if (!std::isfinite(u_yaw_stage1_)) u_yaw_stage1_ = 0.0;
+  if (!std::isfinite(u_base_yaw_stage1_)) u_base_yaw_stage1_ = 0.0;
   
   // 第二级：移动平均（窗口大小3）
   constexpr size_t kSmoothWindowSize = 3;
-  static std::deque<double> u_yaw_history, u_base_yaw_history;
   
-  u_yaw_history.push_back(u_yaw_stage1);
-  u_base_yaw_history.push_back(u_base_yaw_stage1);
+  u_yaw_history_.push_back(u_yaw_stage1_);
+  u_base_yaw_history_.push_back(u_base_yaw_stage1_);
   
-  if (u_yaw_history.size() > kSmoothWindowSize) u_yaw_history.pop_front();
-  if (u_base_yaw_history.size() > kSmoothWindowSize) u_base_yaw_history.pop_front();
+  if (u_yaw_history_.size() > kSmoothWindowSize) u_yaw_history_.pop_front();
+  if (u_base_yaw_history_.size() > kSmoothWindowSize) u_base_yaw_history_.pop_front();
   
   double u_yaw_stage2 = 0.0, u_base_yaw_stage2 = 0.0;
-  for (double u : u_yaw_history) u_yaw_stage2 += u;
-  for (double u : u_base_yaw_history) u_base_yaw_stage2 += u;
-  u_yaw_stage2 /= u_yaw_history.size();
-  u_base_yaw_stage2 /= u_base_yaw_history.size();
+  // 添加除零保护
+  if (!u_yaw_history_.empty()) {
+    for (double u : u_yaw_history_) u_yaw_stage2 += u;
+    u_yaw_stage2 /= u_yaw_history_.size();
+  } else {
+    u_yaw_stage2 = u_yaw_stage1_;
+  }
+  
+  if (!u_base_yaw_history_.empty()) {
+    for (double u : u_base_yaw_history_) u_base_yaw_stage2 += u;
+    u_base_yaw_stage2 /= u_base_yaw_history_.size();
+  } else {
+    u_base_yaw_stage2 = u_base_yaw_stage1_;
+  }
   
   // 第三级：最终输出平滑（强滤波）
   constexpr double kFinalFilterAlpha = 0.92;  // ✅ 最终级强平滑
-  static double u_yaw_final = 0.0, u_base_yaw_final = 0.0;
   
-  u_yaw_final = kFinalFilterAlpha * u_yaw_final + (1.0 - kFinalFilterAlpha) * u_yaw_stage2;
-  u_base_yaw_final = kFinalFilterAlpha * u_base_yaw_final + (1.0 - kFinalFilterAlpha) * u_base_yaw_stage2;
+  u_yaw_final_ = kFinalFilterAlpha * u_yaw_final_ + (1.0 - kFinalFilterAlpha) * u_yaw_stage2;
+  u_base_yaw_final_ = kFinalFilterAlpha * u_base_yaw_final_ + (1.0 - kFinalFilterAlpha) * u_base_yaw_stage2;
   
-  u_yaw_ = u_yaw_final;
-  u_base_yaw_ = u_base_yaw_final;
+  // ✅ 最后一道防线：确保输出有效
+  if (!std::isfinite(u_yaw_final_)) {
+    ROS_ERROR_THROTTLE(1.0, "u_yaw_final is not finite, resetting filter chain");
+    u_yaw_final_ = 0.0;
+    u_yaw_stage1_ = 0.0;
+    u_yaw_history_.clear();
+  }
+  if (!std::isfinite(u_base_yaw_final_)) {
+    ROS_ERROR_THROTTLE(1.0, "u_base_yaw_final is not finite, resetting filter chain");
+    u_base_yaw_final_ = 0.0;
+    u_base_yaw_stage1_ = 0.0;
+    u_base_yaw_history_.clear();
+  }
   
-  // ✅ 6. 限制控制输出幅度（降低上限）
-  constexpr double max_command = 5.0;  // ✅ 从 10.0 降到 5.0
+  u_yaw_ = u_yaw_final_;
+  u_base_yaw_ = u_base_yaw_final_;
   
-  if (!std::isfinite(u_yaw_) || std::abs(u_yaw_) > max_command) {
-    ROS_ERROR_THROTTLE(1.0, "Invalid u_yaw: %.3f, clamping", u_yaw_);
+  // ✅ 6. 限制控制输出幅度（速度命令,单位rad/s）
+  constexpr double max_command = 10.0;  // ✅ 最大角速度10 rad/s (约573°/s)
+  
+  // 先处理NaN/Inf，再限幅
+  if (!std::isfinite(u_yaw_)) {
+    ROS_ERROR_THROTTLE(1.0, "u_yaw is not finite (NaN/Inf), resetting to 0");
+    u_yaw_ = 0.0;
+  } else if (std::abs(u_yaw_) > max_command) {
+    ROS_WARN_THROTTLE(1.0, "u_yaw %.3f exceeds limit, clamping to ±%.1f", u_yaw_, max_command);
     u_yaw_ = std::copysign(max_command, u_yaw_);
   }
-  if (!std::isfinite(u_base_yaw_) || std::abs(u_base_yaw_) > max_command) {
-    ROS_ERROR_THROTTLE(1.0, "Invalid u_base_yaw: %.3f, clamping", u_base_yaw_);
+  
+  if (!std::isfinite(u_base_yaw_)) {
+    ROS_ERROR_THROTTLE(1.0, "u_base_yaw is not finite (NaN/Inf), resetting to 0");
+    u_base_yaw_ = 0.0;
+  } else if (std::abs(u_base_yaw_) > max_command) {
+    ROS_WARN_THROTTLE(1.0, "u_base_yaw %.3f exceeds limit, clamping to ±%.1f", u_base_yaw_, max_command);
     u_base_yaw_ = std::copysign(max_command, u_base_yaw_);
   }
   
@@ -931,7 +1103,13 @@ void Controller::updateRLS(){
     return;
   }
   
-  std::lock_guard<std::mutex> lk_rls(rls_mutex_);
+  // ✅ 使用try_lock避免阻塞主控制循环
+  std::unique_lock<std::mutex> lk_rls(rls_mutex_, std::try_to_lock);
+  if (!lk_rls.owns_lock()) {
+    // 工作线程正在更新,跳过本次RLS更新(不影响控制稳定性)
+    ROS_DEBUG_THROTTLE(5.0, "RLS mutex busy, skipping update");
+    return;
+  }
   
   if (have_prev_sample_ && !driver_saturated_) {
     // ✅ 检测速度异常
@@ -1056,20 +1234,19 @@ void Controller::updateRLS(){
     }
     
     // 计算平均误差
-    static std::deque<double> error_samples;
     constexpr size_t kErrorSampleSize = 50;
     
     double tracking_error = err.norm();
-    error_samples.push_back(tracking_error);
-    if (error_samples.size() > kErrorSampleSize) {
-      error_samples.pop_front();
+    error_samples_.push_back(tracking_error);
+    if (error_samples_.size() > kErrorSampleSize) {
+      error_samples_.pop_front();
     }
     
     double sum_error = 0.0;
-    for (double e : error_samples) {
+    for (double e : error_samples_) {
       sum_error += e;
     }
-    recent_avg_error_ = sum_error / error_samples.size();
+    recent_avg_error_ = error_samples_.empty() ? 0.0 : sum_error / error_samples_.size();
     
     // 应用物理约束
     applyPhysicalConstraints();
@@ -1142,7 +1319,14 @@ void Controller::onlineLQRUpdate(){
       size_t current_samples;
       double current_error;
       {
-        std::lock_guard<std::mutex> lk(rls_mutex_);
+        std::unique_lock<std::mutex> lk(rls_mutex_, std::try_to_lock);
+        
+        if (!lk.owns_lock()) {
+          // 主线程正在updateRLS,跳过本次更新
+          ROS_DEBUG_THROTTLE(5.0, "rls_mutex busy, skipping LQR update");
+          rate.sleep();
+          continue;
+        }
         
         if (!running_) break;
         
@@ -1160,6 +1344,9 @@ void Controller::onlineLQRUpdate(){
         Theta_copy = Theta_;
         current_error = recent_avg_error_;
       }
+      
+      // ✅ 退出前再次检查
+      if (!running_) break;
       
       // 3. 自适应更新策略
       updateStrategy(current_error);
@@ -1247,13 +1434,24 @@ void Controller::onlineLQRUpdate(){
       }
       
       if (stable_count_ >= required_stable_count) {
+        // ✅ 更新前检查是否应该退出
+        if (!running_) break;
+        
         // 7. 自适应切换时间
         double switch_time = (update_strategy_ == STRATEGY_QUICK) ? 0.3 : 
                             (update_strategy_ == STRATEGY_STABLE) ? 0.5 : 1.0;
         
+        // ✅ 使用try_lock避免阻塞在这里
         {
-          std::lock_guard<std::mutex> lk(K_mutex_);
+          std::unique_lock<std::mutex> lk(K_mutex_, std::try_to_lock);
+          if (!lk.owns_lock()) {
+            ROS_DEBUG("K_mutex busy during LQR update, will retry next cycle");
+            rate.sleep();
+            continue;  // 下次再试
+          }
+          if (!running_) break;  // 再次检查
           K_target_ = K_new;
+          K_safe_read_ = K_current_;  // ✅ 在切换前先缓存当前值
           switching_ = true;
           switch_start_time_ = ros::Time::now();
           switch_smooth_T_ = switch_time;
