@@ -321,11 +321,13 @@ private:
 
   //LQR_UPDATE
   Eigen::MatrixXd K_use_;
-  Eigen::MatrixXd K_current_; // m x n
+  Eigen::MatrixXd K_current_; // m x n (只在持有K_mutex_时访问)
   Eigen::MatrixXd K_target_;
   Eigen::MatrixXd K_old_;
+  Eigen::MatrixXd K_safe_read_;  // ✅ 主循环读取用(受K_mutex_保护)
   std::mutex K_mutex_;
   std::atomic<bool> switching_;
+  std::atomic<bool> K_ready_;  // ✅ 标记K_safe_read_是否已初始化
   ros::Time switch_start_time_;
   double switch_smooth_T_;
   //LQR_UPDATE_END
@@ -448,6 +450,27 @@ private:
   UpdateStrategy update_strategy_{STRATEGY_INITIAL};
   double recent_avg_error_{0.0};
   std::deque<double> error_window_;
+
+  // ✅ 速度滤波器状态变量（防止Gazebo崩溃）
+  double last_yaw_vel_{0.0};
+  double last_base_yaw_vel_{0.0};
+  double last_pitch_vel_{0.0};
+  std::deque<double> yaw_vel_buffer_;
+  std::deque<double> base_yaw_vel_buffer_;
+  std::deque<double> pitch_vel_buffer_;
+  
+  // ✅ 输出滤波器状态变量
+  std::deque<double> error_history_;
+  double u_yaw_stage1_{0.0};
+  double u_base_yaw_stage1_{0.0};
+  bool filter_initialized_{false};
+  std::deque<double> u_yaw_history_;
+  std::deque<double> u_base_yaw_history_;
+  double u_yaw_final_{0.0};
+  double u_base_yaw_final_{0.0};
+  
+  // ✅ updateStrategy 误差采样
+  std::deque<double> error_samples_;
   int successful_updates_{0};
   
   std::unique_ptr<NonlinearTrackingDifferentiator<double>> td_yaw_;
